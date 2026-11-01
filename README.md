@@ -1,5 +1,3 @@
-# dmg_format_patcher — формат цифр урона/лечения (WoW 3.3.5a 12340)
-
 *[Русский](#russian) | [English](#english)*
 
 ---
