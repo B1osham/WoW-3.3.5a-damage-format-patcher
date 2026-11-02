@@ -1,39 +1,27 @@
 package main
 
-// cave.go — машинный код подбора цвета по школе магии, вшиваемый в новую
-// секцию клиента, и мини-ассемблер для его генерации с вычислением переходов.
+// cave.go — машинный код, вшиваемый в секцию клиента, и мини-ассемблер
+// для его генерации.
 //
-// Поведение до патча (3.3.5a, 12340): в двух функциях летающего текста урона
-// цвет спелл-урона подбирается одной командой mov eax/edi, 0xADA6C — это
-// указатель на глобальный жёлтый цвет s_petSpellDamageColor (0xFFFFDE00).
-// Автоатаки идут по ветке melee с color=nullptr и остаются белыми после
-// патча — по требованию.
-//
-// Вшитый код заменяет этот mov: берёт SpellRec (аргумент [ebp+0x10]) и его
-// поле m_schoolMask (SpellRec+0x284), вычисляет номер школы (bsf младшего
-// установленного бита) и загружает цвет из собственной таблицы. Число
-// упаковано как 0xAARRGGBB — байты CImVector лежат в порядке b,g,r,a.
+// До патча цвет спелл-урона выбирается одной командой mov eax/edi, 0xADA6C
+// (адрес глобального жёлтого s_petSpellDamageColor), автоатаки идут мимо
+// неё и остаются белыми. Вшитый стаб вместо этого читает SpellRec
+// ([ebp+0x10], поле m_schoolMask на +0x284) и берёт цвет из своей таблицы
+// через LUT по маске. Цвет упакован как 0xAARRGGBB (байты CImVector
+// лежат в порядке b,g,r,a).
 
 const (
-	// Значение «жёлтый» до патча: mov eax/edi, 0x00ADA6C — адрес
-	// s_petSpellDamageColor. То же значение вшивается как fallback, когда
-	// schoolMask пуст или неизвестен (например spellColor без SpellRec).
+	// адрес глобального жёлтого цвета — он же fallback при пустой маске
 	yellowColorVA = 0x00ADA6C
-
-	// spellRecSchool — смещение SpellRec::m_schoolMask (колонка schoolMask).
-	spellRecSchool = 0x284
 )
 
-// schoolType — тип школы из таблицы клиента (SPELL_SCHOOL_*, mask →
-// цвет 0xAARRGGBB). Смешанные типы (HOLYFIRE, SPELLSHADOW, ELEMENTAL и
-// т.д.) имеют свой цвет; «магия над физикой» и chaos — прямо в это
-// соответствие: стаб ищет цвет через LUT по значению маски.
+// schoolType — маска школы → цвет (0xAARRGGBB), маски из DBC клиента.
 type schoolType struct {
 	mask  byte
 	color uint32
 }
 
-// Цвета по маскам (маски — из таблицы школ 12340).
+// Цвета по маскам из таблицы школ 12340.
 var schoolTypes = []schoolType{
 	{0x01, argb(255, 255, 255)}, // SPELL_SCHOOL_NORMAL — белый
 	{0x02, argb(255, 230, 120)}, // SPELL_SCHOOL_HOLY — золотистый «свет»
@@ -71,8 +59,8 @@ func argb(r, g, b uint32) uint32 {
 	return 0xFF000000 | r<<16 | g<<8 | b
 }
 
-// lutMaskIndexes — LUT «маска → индекс цвета» (128 байт). Неизвестная
-// значению маска даёт индекс fallback-цвета (старый жёлтый).
+// lutMaskIndexes — таблица «маска → индекс цвета», 128 байт.
+// Неизвестная маска даёт fallback.
 func lutMaskIndexes() []byte {
 	lut := make([]byte, 0x80)
 	unknown := byte(len(schoolTypes)) // fallback
@@ -85,8 +73,7 @@ func lutMaskIndexes() []byte {
 	return lut
 }
 
-// Смещения в ЕДИНОЙ вшитой секции: конфиг и код форматтера цифр (как в
-// dmg_format_patcher), затем школа цветов (LUT + таблица) и два стаба.
+// Раскладка вшитой секции: конфиг и код форматтера, затем LUT и стабы цвета.
 // Адреса в клиенте, нужные форматтеру: строки форматов и сам SStrPrintf.
 const (
 	fmtPlainVA   = 0x009E289C // "%d"
@@ -118,8 +105,7 @@ var (
 	schMagic = [4]byte{'W', '3', 'C', 'S'}
 )
 
-// asmBuf — лента кода с метками и rel32-фикапами (копия подхода
-// dmg_format_patcher: обходимся без внешнего ассемблера).
+// asmBuf — лента кода с метками и rel32-фикапами.
 type asmBuf struct {
 	b      []byte
 	labels map[string]int
@@ -197,11 +183,9 @@ type asmError struct{ msg string }
 
 func (e asmError) Error() string { return e.msg }
 
-// genStub собирает один стаб: dest — регистр назначения цвета (0xB8 — eax
-// для AddWorldDamageText, 0xBF — edi для AddWorldText), backVA — адрес,
-// куда вернуть управление после подстановки цвета (команда за патченным
-// mov), tableVA — VA таблицы цветов, stubVA — VA стаба в образе (нужен
-// для rel32 перехода backVA).
+// genStub — стаб для одного сайта: dest — регистр цвета (0xB8 eax /
+// 0xBF edi), backVA — адрес возврата, ptrTableVA/lutVA — таблицы в
+// секции, stubVA — адрес стаба (для rel32).
 func genStub(dest byte, backVA, ptrTableVA, lutVA, stubVA uint32) ([]byte, error) {
 	// mov r32, [ebp+0x10] — spell. ModRM: reg=0 (eax) или 7 (edi).
 	var dstIdx byte = 0
@@ -222,8 +206,7 @@ func genStub(dest byte, backVA, ptrTableVA, lutVA, stubVA uint32) ([]byte, error
 	// movzx eax, byte [dest + lutVA] — индекс цвета по маске (LUT)
 	a.emit(0x0F, 0xB6, 0x80|dstIdx)
 	a.imm32(lutVA)
-	// mov dest, [eax*4 + ptrTableVA] — УКАЗАТЕЛЬ на цвет (клиент ждёт
-	// const CImVector*, а не значение)
+	// mov dest, [eax*4 + ptrTableVA] — указатель на цвет, не значение
 	a.emit(0x8B, 0x04|(dstIdx<<3), 0x85)
 	a.imm32(ptrTableVA)
 	a.jmp("back")
@@ -231,9 +214,8 @@ func genStub(dest byte, backVA, ptrTableVA, lutVA, stubVA uint32) ([]byte, error
 	// mov dest, 0xADA6C — original yellow fallback
 	a.emit(dest, 0x6C, 0xAA, 0xAD, 0x00)
 	a.label("back")
-	// rel32 на backVA считается от конца команды, поэтому нужен
-	// абсолютный VA команды. here() даёт локальное смещение внутри стаба;
-	// конец команды = stubVA + here() + 5.
+	// rel32 до backVA: здесь() даёт смещение внутри стаба, конец команды
+	// = stubVA + here() + 5.
 	at := hereAt(a, stubVA)
 	a.emit(0xE9)
 	a.imm32(uint32(int64(backVA) - int64(at+5)))
@@ -245,9 +227,8 @@ func hereAt(a *asmBuf, stubVA uint32) uint32 {
 	return stubVA + uint32(a.here())
 }
 
-// buildCaveImage — образ ЕДИНОЙ секции: конфиг + две копии форматтера
-// (урон/лечение со своими настройками) + по требованию блок школы:
-// таблица цветов, их указатели и LUT «маска → индекс», затем два стаба.
+// buildCaveImage — образ секции: конфиг + две копии форматтера + блок
+// школы (цвета, указатели на них, LUT) + два стаба.
 func buildCaveImage(dmgMode, dmgDec, healMode, healDec byte, withSchool bool, caveVA uint32) ([]byte, error) {
 	img := make([]byte, caveSize)
 	img[offModeDmg], img[offDecDmg] = dmgMode, dmgDec
@@ -274,7 +255,7 @@ func buildCaveImage(dmgMode, dmgDec, healMode, healDec byte, withSchool bool, ca
 		if colorsOff+4*n > ptrTableOff || ptrTableOff+4*n > lutOff || lutOff+0x80 > offStubA {
 			return nil, asmError{"блок школы не влезает в слоты секции"}
 		}
-		// Цвета и указатели на них (клиент получает УКАЗАТЕЛЬ на цвет).
+		// значения цветов и указатели на них
 		for i, st := range schoolTypes {
 			imm32At(img, colorsOff+4*i, st.color)
 			imm32At(img, ptrTableOff+4*i, caveVA+colorsOff+uint32(4*i))

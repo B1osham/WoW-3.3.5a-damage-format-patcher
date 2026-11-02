@@ -1,22 +1,13 @@
 package main
 
-// addon.go — генерация аддона dmg_format_patcher для «своего»
-// всплывающего текста.
+// addon.go — генерация аддона для «своего» всплывающего текста.
 //
-// Урон и лечение самого себя рисует не exe, а аддон Blizzard_CombatText
-// (LoadOnDemand): в CombatText_OnEvent сообщение собирается конкатенацией
-// ("-"..data / "+"..arg3, Blizzard_CombatText.lua), и в exe его не
-// перехватить. Поэтому генерируется мини-аддон, который перехватывает
-// итоговую выдачу:
-//
-//	CombatText_AddMessage(message, scrollFunction, r, g, b, displayType, isStaggered)
-//
-// и: (1) переформатирует ведущее число ("-N" — урон, "+N" — лечение),
-// (2) при включённой школе меняет цвет урона: в COMBAT_TEXT_UPDATE нет
-// информации о школе, поэтому перед хуком слушаем COMBAT_LOG_EVENT_UNFILTERED
-// и запоминаем (сумма → школа) последних полученных игроком уронов;
-// сообщение с подходящей суммой за последние ~0.7 с красится цветом школы
-// (то же правило приоритета магии над физикой, что и в exe).
+// Урон/лечение самого себя рисует аддон Blizzard_CombatText, в exe это
+// не перехватить. Генерируемый аддон хукает CombatText_AddMessage:
+// переформатирует число ("-N" урон, "+N" лечение) и при включённой
+// школе подкрашивает урон — школу берёт из кэша последних
+// COMBAT_LOG_EVENT_UNFILTERED-уронов по игроку (совпадение по сумме:
+// в COMBAT_TEXT_UPDATE школы нет).
 
 import (
 	"fmt"
@@ -36,7 +27,7 @@ const addonToc = `## Interface: 30300
 dmg_format.lua
 `
 
-// addonLuaTmpl — шаблон хука. Плейсхолдеры заменяет strings.NewReplacer.
+// addonLuaTmpl — шаблон хука, {PLACES} заменяются при генерации.
 const addonLuaTmpl = `-- Сгенерировано school_colors_patcher: формат цифр собственного
 -- всплывающего текста и их цвет по школе заклинания. Обновляется
 -- повторным запуском патчера.
@@ -192,7 +183,7 @@ func addonLua(dmg, heal formatCfg, school bool) string {
 	).Replace(addonLuaTmpl)
 }
 
-// writeAddon создаёт аддон в dir\Interface\AddOns\school_colors_patcher.
+// writeAddon создаёт аддон в dir\Interface\AddOns\dmg_format_patcher.
 func writeAddon(dir string, dmg, heal formatCfg, school bool) (string, error) {
 	base := filepath.Join(dir, "Interface", "AddOns", addonFolder)
 	if err := os.MkdirAll(base, 0o755); err != nil {
@@ -215,7 +206,7 @@ func writeAddon(dir string, dmg, heal formatCfg, school bool) (string, error) {
 	return base, nil
 }
 
-// removeAddon удаляет наш аддон (для --restore). Чужие файлы не трогаем.
+// removeAddon удаляет наш аддон, чужие файлы не трогает.
 func removeAddon(dir string) bool {
 	base := filepath.Join(dir, "Interface", "AddOns", addonFolder)
 	toc := filepath.Join(base, addonFolder+".toc")

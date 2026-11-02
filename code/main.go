@@ -1,33 +1,25 @@
-// dmg_format_patcher — патчер боевых цифр WoW 3.3.5a (build 12340):
-// формат чисел урона/лечения (влит из dmg_format_patcher) и цвет цифр
-// урона по школе магии, плюс генерируемый аддон для «своего» текста.
+// dmg_format_patcher — формат цифр боя и цвет урона по школе магии
+// для WoW 3.3.5a (12340).
 //
-// Два типа патчей:
-//
-//	формат чисел — перенаправление четырёх вызовов SStrPrintf на вшитый
-//	  форматтер (plain / 1.234.567 / 111.11K с выбором знаков),
-//	цвет школы — подмена mov eax/edi, 0xADA6C (жёлтый глобал) на переход
-//	  во вшитый стаб: SpellRec::m_schoolMask → таблица цветов (байт
-//	  приоритет магии над физикой), автоатаки остаются белыми.
+// Формат чисел: четыре вызова SStrPrintf перенаправляются на вшитый
+// форматтер (plain / 1.234.567 / 111.11K).
+// Цвет школы: mov eax/edi, 0xADA6C (жёлтый глобал) заменяется на переход
+// в стаб, который по SpellRec::m_schoolMask выбирает цвет из таблицы.
 //
 // Сайты:
 //
-//	0x0070F8B4, 0x0070F914, 0x007223CF — вызовы формата урона
-//	0x00722494                          — вызов формата лечения
-//	0x0072240A                          — цвет урона (mov eax,  0xADA6C)
-//	0x0071FA36                          — цвет DoT/свод (mov edi, 0xADA6C)
+//	0x0070F8B4, 0x0070F914, 0x007223CF — формат урона (call)
+//	0x00722494                          — формат лечения (call)
+//	0x0072240A                          — цвет урона (mov eax)
+//	0x0071FA36                          — цвет DoT/сводок (mov edi)
 //
-// Вшитый код живёт в одной секции: пустая .zdata (4 КБ) или новая секция
-// .w3cs в конце файла (ставится и на уже модифицированные клиенты).
-// Сайты сверяются до патча: исходный байт или уже наш переход — иначе
-// отказ, файл не пишется.
+// Код вшивается в пустую .zdata либо в новую секцию .w3cs в конце файла.
+// Сайты перед патчем сверяются: не исходный байт и не наш переход — отказ.
 //
 // Запуск:
 //
 //	dmg_format_patcher.exe                    — найдёт Wow.exe рядом
 //	dmg_format_patcher.exe "D:\WoW\Wow.exe"   — указать exe явно
-//	... --dmg=short:2 --heal=dots --school=1 --addon=0  — без вопросов
-//	  (--school: 1 — цвет школы, 0 — жёлтый как в игре)
 //	dmg_format_patcher.exe --restore          — вернуть оригинал
 //	dmg_format_patcher.exe --lang=en          — язык сообщений
 package main
@@ -62,10 +54,9 @@ const (
 
 var dmgCallVAs = []uint32{damageCallVA1, damageCallVA2, damageCallVA3}
 
-// colorSite — сайт подмены цвета: адрес mov, исходные байты и смещение
-// стаба в образе секции. Стаб возвращает ПОСТАВЩИКУ УКАЗАТЕЛЬ на цвет
-// (const CImVector*), как исходный mov eax/edi, 0xADA6C, — грузят
-// указатели из своей таблицы, поэтому значения лежат отдельно.
+// colorSite — сайт подмены цвета: адрес mov, исходные байты, смещение
+// стаба. Стаб возвращает клиенту указатель на цвет (исходный mov грузил
+// адрес глобала), значения цветов и их указатели лежат отдельно.
 type colorSite struct {
 	va   uint32
 	orig [5]byte
@@ -92,7 +83,6 @@ func fmtErr(format string, args ...any) error {
 	return fmt.Errorf("%s", fmt.Sprintf(format, args...))
 }
 
-// main — вход: разбор, чтение, патч.
 func main() {
 	setupConsole()
 	setupColors()
@@ -194,9 +184,9 @@ func printUsage() {
 		"  format: plain | dots | short[:DEC], DEC=1..3 (default 2)"))
 }
 
-// ---------- формат чисел (влит из dmg_format_patcher) ----------
+// ---------- формат чисел ----------
 
-// formatCfg — выбранный формат для одной группы чисел.
+// formatCfg — формат одной группы чисел.
 type formatCfg struct {
 	mode byte // 0 plain, 1 dots, 2 short
 	dec  byte // знаков после точки для short (1..3)
@@ -355,8 +345,7 @@ func askAddonSchool(r *bufio.Reader, exeSchool bool) bool {
 	return yesNo(r)
 }
 
-// askSchool — цвет цифр урона заклинаниями (и в мире, и в аддоне «своего»
-// текста, если он включён). Enter = включить.
+// askSchool — цвет цифр урона в мире. Enter = включить.
 func askSchool(r *bufio.Reader) bool {
 	printC(colorYellow, tr(
 		"Цвет цифр заклинаний:\n",
@@ -398,8 +387,8 @@ func yesNo(r *bufio.Reader) bool {
 	}
 }
 
-// resolveArgs сводит CLI и интерактив к конкретному выбору. Возвращает
-// false, если пользователь отменил всё.
+// resolveArgs применяет CLI-флаги, чего не хватило — спрашивает
+// интерактивом. ok=false — пользователь отменил.
 func resolveArgs(curDmg, curHeal formatCfg, curSchool bool) (dmg formatCfg, heal formatCfg, school bool, wantAddon bool, addonSchool bool, ok bool) {
 	r := bufio.NewReader(os.Stdin)
 
@@ -441,8 +430,6 @@ func resolveArgs(curDmg, curHeal formatCfg, curSchool bool) (dmg formatCfg, heal
 	default:
 		wantAddon = askAddon(r)
 	}
-	// Вопрос про цвет в аддоне — сразу после вопроса об аддоне, и только
-	// если аддон ставится: «не надо аддон» = оба пропущены.
 	switch strings.ToLower(cliAddonSch) {
 	case "1", "да", "yes", "y", "д", "on", "true":
 		addonSchool = true
@@ -460,7 +447,7 @@ func resolveArgs(curDmg, curHeal formatCfg, curSchool bool) (dmg formatCfg, heal
 
 // ---------- применение патча ----------
 
-// readCurrentConfig читает сохранённые настройки из вшитой секции.
+// readCurrentConfig — настройки, сохранённые во вшитой секции.
 func readCurrentConfig(data []byte, pe *peInfo) (dmg, heal formatCfg, school bool) {
 	dmg = formatCfg{mode: 0, dec: 2}
 	heal = formatCfg{mode: 0, dec: 2}
@@ -484,7 +471,7 @@ func readCurrentConfig(data []byte, pe *peInfo) (dmg, heal formatCfg, school boo
 	return dmg, heal, school
 }
 
-// siteByte — что должно лежать (или уже лежать) в первом байте сайта.
+// siteByte — ожидаемый первый байт сайта.
 func siteByte(va uint32) byte {
 	for _, d := range dmgCallVAs {
 		if d == va {
@@ -494,8 +481,7 @@ func siteByte(va uint32) byte {
 	if va == healCallVA {
 		return 0xE8 // call
 	}
-	return 0xB8 // mov (эквивалентность обоих цветовых mov не критична:
-	//          сравнивается целиком ниже)
+	return 0xB8 // mov
 }
 
 func doPatch(exe string, pe *peInfo, dmg, heal formatCfg, school, wantAddon, addonSchool bool) (code int) {
@@ -512,7 +498,6 @@ func doPatch(exe string, pe *peInfo, dmg, heal formatCfg, school, wantAddon, add
 	}
 	copy(data[caveOff:caveOff+caveSize], img)
 
-	// Собираем список правок: форматтер + школа.
 	type edit struct{ va, target uint32 }
 	var edits []edit
 	for _, va := range dmgCallVAs {
@@ -533,8 +518,7 @@ func doPatch(exe string, pe *peInfo, dmg, heal formatCfg, school, wantAddon, add
 			return 2
 		}
 		first := data[off]
-		// oursOrOrig: первый байт — исходный (0xE8 call / 0xB8, 0xBF mov)
-		// или наш ранний переход (0xE9) — оба случая правим заново.
+		// исходный байт или уже наша правка — оба варианта правим заново
 		if first != 0xE8 && first != 0xE9 && first != 0xB8 && first != 0xBF {
 			errln("ОШИБКА / ERROR: " + fmtErr(tr(
 				"по адресу %08X нет call/mov (байт %02X) — это не билд 12340 или сайт занят чужим патчем; файл не изменён.",
@@ -609,8 +593,7 @@ func ensureCave(exe string, pe *peInfo) (int, uint32, []byte, error) {
 			}
 		}
 	}
-	// Не наша секция .w3cs (например от старого dots-патча): смотрим,
-	// хватиёт ли размера — переписываем под наш образ целиком.
+	// Чужая секция .w3cs подходящего размера — переписываем целиком.
 	for i := range pe.sections {
 		s := &pe.sections[i]
 		if s.name == addSecName && s.rawsize >= caveSize {
@@ -676,8 +659,7 @@ func addSection(data []byte, pe *peInfo) (int, uint32, []byte, error) {
 	return int(rawPtr), imageBase + vaddr, out, nil
 }
 
-// doRestore возвращает оригинальные вызовы/mov на всех шести сайтах и
-// чистит вшитый код.
+// doRestore возвращает оригинальные байты на всех сайтах и чистит код.
 func doRestore(exe string) int {
 	data, err := os.ReadFile(exe)
 	if err != nil {
