@@ -1,33 +1,35 @@
-// dmg_format_patcher — патчер летающих цифр урона/лечения WoW 3.3.5a (12340).
+// dmg_format_patcher — патчер боевых цифр WoW 3.3.5a (build 12340):
+// формат чисел урона/лечения (влит из dmg_format_patcher) и цвет цифр
+// урона по школе магии, плюс генерируемый аддон для «своего» текста.
 //
-// Что делает: в клиенте числа боя форматируются через
-// SStrPrintf(buf, 0x20, "%d"|"+%d", value) (VA 0x0076F070) в четырёх местах:
+// Два типа патчей:
 //
-//	0x0070F8B4, 0x0070F914 — безымянная функция летающего текста урона
-//	                          (гейтится CVar s_cvCombatDamage)
-//	0x007223CF              — CGUnit_C::AddWorldDamageText
-//	0x00722494              — CGUnit_C::AddWorldHealingText (там "+%d")
+//	формат чисел — перенаправление четырёх вызовов SStrPrintf на вшитый
+//	  форматтер (plain / 1.234.567 / 111.11K с выбором знаков),
+//	цвет школы — подмена mov eax/edi, 0xADA6C (жёлтый глобал) на переход
+//	  во вшитый стаб: SpellRec::m_schoolMask → таблица цветов (байт
+//	  приоритет магии над физикой), автоатаки остаются белыми.
 //
-// Патч перенаправляет call на вшитую в exe функцию-форматтер (см. cave.go),
-// которая умеет три режима отображения: обычные цифры, 1.234.567 (точки) и
-// 111.11K / 111.11M с выбираемым числом знаков после точки (1..3).
-// Урон и лечение настраиваются независимо: в пещеру вшиваются две копии кода
-// со своими байтами конфигурации.
+// Сайты:
 //
-// Куда вшивается код: если секция .zdata (VA 0x00DD1000, 4КБ) пуста — в неё
-// (как в исходном dots-патче); если занята (другой патч) — в конец файла
-// добавляется новая секция .w3fm, и exe становится больше. Поэтому патч
-// ставится и на уже модифицированные клиенты.
+//	0x0070F8B4, 0x0070F914, 0x007223CF — вызовы формата урона
+//	0x00722494                          — вызов формата лечения
+//	0x0072240A                          — цвет урона (mov eax,  0xADA6C)
+//	0x0071FA36                          — цвет DoT/свод (mov edi, 0xADA6C)
+//
+// Вшитый код живёт в одной секции: пустая .zdata (4 КБ) или новая секция
+// .w3cs в конце файла (ставится и на уже модифицированные клиенты).
+// Сайты сверяются до патча: исходный байт или уже наш переход — иначе
+// отказ, файл не пишется.
 //
 // Запуск:
 //
-//	dmg_format_patcher.exe                    — интерактивный выбор формата
+//	dmg_format_patcher.exe                    — найдёт Wow.exe рядом
 //	dmg_format_patcher.exe "D:\WoW\Wow.exe"   — указать exe явно
-//	флаги: --dmg=MODE[:DEC] --heal=MODE[:DEC] — без вопросов
-//	  MODE: 0|plain — как в игре, 1|dots — 1.234.567, 2|short — 111.11K/111.11M
-//	  DEC:  знаков после точки для short (1..3, по умолчанию 2)
-//	--lang=ru|en — язык сообщений (по умолчанию русский)
-//	--restore — вернуть оригинальные вызовы SStrPrintf
+//	... --dmg=short:2 --heal=dots --school=1 --addon=0  — без вопросов
+//	  (--school: 1 — цвет школы, 0 — жёлтый как в игре)
+//	dmg_format_patcher.exe --restore          — вернуть оригинал
+//	dmg_format_patcher.exe --lang=en          — язык сообщений
 package main
 
 import (
@@ -42,27 +44,43 @@ import (
 )
 
 const (
-	imageBase = 0x00400000
+	imageBase     = 0x00400000
+	damageCallVA1 = 0x0070F8B4 // вызов формата урона
+	damageCallVA2 = 0x0070F914
+	damageCallVA3 = 0x007223CF
+	healCallVA    = 0x00722494 // вызов формата лечения
+	backDamageVA  = 0x0072240F // возврат стаба цвета: AddWorldDamageText
+	backWorldVA   = 0x0071FA3B // возврат стаба цвета: AddWorldText
 
-	// Сайт лечения: call rel32 → SStrPrintf. Сайты урона перечислены в doPatch.
-	healCallVA = 0x00722494
-
-	// .zdata: VA 0x00DD1000, файловый указатель 0x72CE00, 0x1000 байт.
 	zdataName  = ".zdata"
 	zdataVA    = 0x00DD1000
-	addSecName = ".w3fm"
+	addSecName = ".w3cs"
 	fileAlign  = 0x200
 	sectAlign  = 0x1000
 	secCharRWX = 0xE0000060 // CODE|INITIALIZED_DATA|EXECUTE|READ|WRITE
 )
 
+var dmgCallVAs = []uint32{damageCallVA1, damageCallVA2, damageCallVA3}
+
+// colorSite — сайт подмены цвета: адрес mov, исходные байты и смещение
+// стаба в образе секции. Стаб возвращает ПОСТАВЩИКУ УКАЗАТЕЛЬ на цвет
+// (const CImVector*), как исходный mov eax/edi, 0xADA6C, — грузят
+// указатели из своей таблицы, поэтому значения лежат отдельно.
+type colorSite struct {
+	va   uint32
+	orig [5]byte
+	stub uint32
+}
+
+var colorSites = []colorSite{
+	{0x0072240A, [5]byte{0xB8, 0x6C, 0xAA, 0xAD, 0x00}, offStubA}, // AddWorldDamageText
+	{0x0071FA36, [5]byte{0xBF, 0x6C, 0xAA, 0xAD, 0x00}, offStubB}, // AddWorldText
+}
+
 // ---------- язык сообщений ----------
 
-// lang — текущий язык интерфейса: "ru" (по умолчанию) или "en".
 var lang = "ru"
 
-// tr возвращает сообщение на выбранном языке. Все тексты программы проходят
-// через неё, поэтому перевод держится в одном месте — рядом с местом вывода.
 func tr(ru, en string) string {
 	if lang == "en" {
 		return en
@@ -70,6 +88,11 @@ func tr(ru, en string) string {
 	return ru
 }
 
+func fmtErr(format string, args ...any) error {
+	return fmt.Errorf("%s", fmt.Sprintf(format, args...))
+}
+
+// main — вход: разбор, чтение, патч.
 func main() {
 	setupConsole()
 	setupColors()
@@ -81,12 +104,10 @@ func main() {
 	if restore {
 		exit(doRestore(exe))
 	}
-
-	// Читаем текущую конфигурацию из exe, если наш патч уже стоит.
 	data, err := os.ReadFile(exe)
 	if err != nil {
 		errln("ОШИБКА / ERROR: " + tr(
-		"не удалось прочитать файл: ", "failed to read the file: ") + err.Error())
+			"не удалось прочитать файл: ", "failed to read the file: ") + err.Error())
 		exit(3)
 	}
 	pe, err := parsePE(data)
@@ -95,80 +116,85 @@ func main() {
 			tr(" — это не PE-файл клиента 3.3.5a.", " — this is not a 3.3.5a client PE file."))
 		exit(2)
 	}
-	curDmg, curHeal := readCurrentConfig(data, pe)
 
-	var dmg, heal formatCfg
-	if cliDmg != "" || cliHeal != "" {
-		dmg, err = parseFmt(cliDmg, curDmg)
-		if err != nil {
-			errln(tr("ОШИБКА: --dmg: ", "ERROR: --dmg: ") + err.Error())
-			exit(1)
-		}
-		heal, err = parseFmt(cliHeal, curHeal)
-		if err != nil {
-			errln(tr("ОШИБКА: --heal: ", "ERROR: --heal: ") + err.Error())
-			exit(1)
-		}
-	} else {
-		dmg, heal = askFormats(curDmg, curHeal)
+	curDmg, curHeal, curSchool := readCurrentConfig(data, pe)
+	dmg, heal, school, wantAddon, addonSchool, ok := resolveArgs(curDmg, curHeal, curSchool)
+	if !ok {
+		return
 	}
+	exit(doPatch(exe, pe, dmg, heal, school, wantAddon, addonSchool))
+}
 
-	// Флаг --addon= без интерактива: да/нет в любом написании.
-	if cliAddon != "" {
-		switch strings.ToLower(cliAddon) {
-		case "1", "да", "yes", "y", "on", "true":
-			wantAddon = true
-		case "0", "нет", "no", "n", "off", "false":
-			wantAddon = false
+// ---------- разбор аргументов ----------
+
+var (
+	cliDmg      string
+	cliHeal     string
+	cliAddon    string // "" — не задан, "1"/"0" — из флага
+	cliSch      string // "" — не задан, "0"/"1" — цвет школы в exe
+	cliAddonSch string // "" — не задан, "0"/"1" — цвет школы в аддоне
+)
+
+func parseArgs(argv []string) (targets []string, restore bool) {
+	for _, a := range argv {
+		switch {
+		case a == "--restore" || a == "-restore" || a == "/restore":
+			restore = true
+		case strings.HasPrefix(a, "--dmg="):
+			cliDmg = strings.TrimPrefix(a, "--dmg=")
+		case strings.HasPrefix(a, "--heal="):
+			cliHeal = strings.TrimPrefix(a, "--heal=")
+		case strings.HasPrefix(a, "--addon="):
+			cliAddon = strings.TrimPrefix(a, "--addon=")
+		case strings.HasPrefix(a, "--school="):
+			cliSch = strings.TrimPrefix(a, "--school=")
+		case strings.HasPrefix(a, "--addon-school="):
+			cliAddonSch = strings.TrimPrefix(a, "--addon-school=")
+		case strings.HasPrefix(a, "--lang="):
+			switch strings.ToLower(strings.TrimPrefix(a, "--lang=")) {
+			case "ru", "rus", "рус":
+				lang = "ru"
+			case "en", "eng":
+				lang = "en"
+			}
+		case a == "--help" || a == "-h" || a == "/?":
+			printUsage()
+			exit(0)
+		case strings.HasPrefix(a, "-") || strings.HasPrefix(a, "/"):
+			// неизвестные флаги игнорируем
 		default:
-			errln(tr("ОШИБКА: --addon= ждёт 1 или 0", "ERROR: --addon= expects 1 or 0"))
-			exit(1)
+			if len(targets) == 0 {
+				targets = append(targets, a)
+			}
 		}
 	}
-
-	printC(colorRed, tr("урон:    %s\n", "damage: %s\n"), dmg.describe())
-	printC(colorGreen, tr("лечение: %s\n", "heal:   %s\n"), heal.describe())
-	code := doPatch(exe, data, pe, dmg, heal)
-	if code != 0 {
-		exit(code)
-	}
-	if wantAddon {
-		doAddon(exe, dmg, heal)
-	}
-	exit(0)
+	return targets, restore
 }
 
-// wantAddon — решение по аддону «своего» всплывающего текста.
-var wantAddon bool
-
-// doAddon пишет аддон в текущую папку и напоминает перенести его в корень
-// игры, если патчер запущен не оттуда.
-func doAddon(exe string, dmg, heal formatCfg) {
-	cwd, err := os.Getwd()
-	if err != nil {
-		errln(tr("ОШИБКА: не определить текущую папку: ", "ERROR: cannot get current folder: ") + err.Error())
-		return
-	}
-	path, err := writeAddon(cwd, dmg, heal)
-	if err != nil {
-		errln(err.Error())
-		return
-	}
-	printC(colorGreen, tr("аддон:       %s\n", "addon:       %s\n"), path)
-
-	// Патчер могли запустить не из корня игры — тогда аддон лежит не там,
-	// игра аддон не увидит: напоминаем перенести вручную.
-	gameDir, _ := filepath.Abs(filepath.Dir(exe))
-	cwdAbs, _ := filepath.Abs(cwd)
-	if !strings.EqualFold(cwdAbs, gameDir) {
-		printC(colorYellow, tr(
-			"ВНИМАНИЕ: патчер запущен не из корневой папки игры —\n"+
-				"перенесите папку аддона вручную:\n  %s\nв\n  %s\n",
-			"NOTE: the patcher was started outside the game root folder —\n"+
-				"move the addon folder manually:\n  %s\ninto\n  %s\n"),
-			path, filepath.Join(gameDir, "Interface", "AddOns"))
-	}
+func printUsage() {
+	fmt.Println(tr(
+		"Патчер боевых цифр WoW 3.3.5a (12340): форматы чисел и цвет по школе магии.",
+		"Combat numbers patcher for WoW 3.3.5a (12340): number formats and spell-school colors."))
+	fmt.Println()
+	fmt.Println(`  dmg_format_patcher.exe` + tr(
+		"                    ищет Wow.exe рядом с собой",
+		"                    find Wow.exe next to itself"))
+	fmt.Println(`  dmg_format_patcher.exe "D:\WoW\Wow.exe"` + tr(
+		"  указать exe явно", "  specify exe explicitly"))
+	fmt.Println(`  ... --dmg=short:2 --heal=dots --school=1 --addon=0` + tr(
+		" — без вопросов", " — no questions asked"))
+	fmt.Println("  ... --lang=ru|en" + tr(
+		"                  язык сообщений", "                  message language"))
+	fmt.Println("  ... --restore" + tr(
+		"                           вернуть оригинал",
+		"                           restore original"))
+	fmt.Println()
+	fmt.Println(tr(
+		"  формат: plain | dots | short[:DEC], DEC=1..3 (по умолчанию 2)",
+		"  format: plain | dots | short[:DEC], DEC=1..3 (default 2)"))
 }
+
+// ---------- формат чисел (влит из dmg_format_patcher) ----------
 
 // formatCfg — выбранный формат для одной группы чисел.
 type formatCfg struct {
@@ -201,70 +227,6 @@ func clampDec(d byte) byte {
 	return d
 }
 
-// ---------- разбор аргументов ----------
-
-var (
-	cliDmg   string
-	cliHeal  string
-	cliAddon string // "" — не задан (интерактив), "1"/"0" — из флага
-)
-
-func parseArgs(argv []string) (targets []string, restore bool) {
-	for _, a := range argv {
-		switch {
-		case a == "--restore" || a == "-restore" || a == "/restore":
-			restore = true
-		case strings.HasPrefix(a, "--dmg="):
-			cliDmg = strings.TrimPrefix(a, "--dmg=")
-		case strings.HasPrefix(a, "--heal="):
-			cliHeal = strings.TrimPrefix(a, "--heal=")
-		case strings.HasPrefix(a, "--addon="):
-			cliAddon = strings.TrimPrefix(a, "--addon=")
-		case strings.HasPrefix(a, "--lang="):
-			// Язык должен быть известен до первых сообщений.
-			switch strings.ToLower(strings.TrimPrefix(a, "--lang=")) {
-			case "ru", "rus", "рус":
-				lang = "ru"
-			case "en", "eng":
-				lang = "en"
-			}
-		case a == "--help" || a == "-h" || a == "/?":
-			printUsage()
-			exit(0)
-		case strings.HasPrefix(a, "-") || strings.HasPrefix(a, "/"):
-			// неизвестный флаг игнорируем
-		default:
-			if len(targets) == 0 {
-				targets = append(targets, a)
-			}
-		}
-	}
-	return targets, restore
-}
-
-func printUsage() {
-	fmt.Println(tr(
-		"Патчер летающих цифр урона/лечения WoW 3.3.5a (build 12340).",
-		"Damage/heal floating text patcher for WoW 3.3.5a (build 12340)."))
-	fmt.Println()
-	fmt.Println(`  dmg_format_patcher.exe`+
-		tr("                     ищет Wow.exe рядом с собой",
-			"                     find Wow.exe next to itself"))
-	fmt.Println(`  dmg_format_patcher.exe "D:\WoW\Wow.exe"`+
-		tr("    указать exe явно", "    specify exe explicitly"))
-	fmt.Println(`  ... --dmg=short:2 --heal=dots`+
-		tr("              без вопросов", "              no questions asked"))
-	fmt.Println("  ... --lang=ru|en" +
-		tr("                  язык сообщений", "                  message language"))
-	fmt.Println("  ... --restore" +
-		tr("                           вернуть оригинал", "                           restore original calls"))
-	fmt.Println()
-	fmt.Println(tr(
-		"  формат: plain | dots | short[:DEC], DEC=1..3 (по умолчанию 2)",
-		"  format: plain | dots | short[:DEC], DEC=1..3 (default 2)"))
-}
-
-// parseFmt разбирает "plain" / "dots" / "short" / "short:3" / "2:1" / "0".
 func parseFmt(s string, cur formatCfg) (formatCfg, error) {
 	if s == "" {
 		return cur, nil
@@ -301,57 +263,8 @@ func parseFmt(s string, cur formatCfg) (formatCfg, error) {
 	return f, nil
 }
 
-// fmtErr — форматирование ошибки с неконстантной строкой формата:
-// vet запрещает fmtErr(tr(...)) напрямую, поэтому форматируем через
-// Sprintf и оборачиваем результат.
-func fmtErr(format string, args ...any) error {
-	return fmt.Errorf("%s", fmt.Sprintf(format, args...))
-}
-
 // ---------- интерактив ----------
 
-func askFormats(curDmg, curHeal formatCfg) (dmg, heal formatCfg) {
-	r := bufio.NewReader(os.Stdin)
-	askLanguage(r)
-	printC(colorRed, tr("Цифры урона:", "Damage numbers:")+"\n")
-	dmg = askOne(r, curDmg, colorRed)
-	printC(colorGreen, tr("Цифры лечения:", "Heal numbers:")+"\n")
-	heal = askOne(r, curHeal, colorGreen)
-	wantAddon = askAddon(r)
-	return dmg, heal
-}
-
-// askAddon спрашивает, модифицировать ли аддон Blizzard_CombatText: урон/
-// лечение самого себя рисует этот аддон, а не exe, поэтому свой текст
-// нельзя исправить патчем exe. Enter = да.
-func askAddon(r *bufio.Reader) bool {
-	printC(colorYellow, tr(
-		"Свой всплывающий текст (Blizzard_CombatText):\n",
-		"Own floating text (Blizzard_CombatText):\n"))
-	fmt.Println(tr(
-		"  1 — модифицировать аддоном (по умолчанию)",
-		"  1 — modify via addon (default)"))
-	fmt.Println(tr(
-		"  0 — не трогать",
-		"  0 — leave as is"))
-	for {
-		fmt.Print(tr("выбор: ", "choose: "))
-		line, err := r.ReadString('\n')
-		if err != nil {
-			exit(1)
-		}
-		switch strings.TrimSpace(strings.ToLower(line)) {
-		case "", "1", "да", "yes", "y", "д", "on", "true":
-			return true
-		case "0", "нет", "no", "n", "н", "off", "false":
-			return false
-		default:
-			fmt.Println("  " + tr("введите 0 или 1", "enter 0 or 1"))
-		}
-	}
-}
-
-// askLanguage — первый вопрос интерактива: язык сообщений. Enter = русский.
 func askLanguage(r *bufio.Reader) {
 	fmt.Println("Язык / Choose language:")
 	fmt.Println("  1 — Русский (по умолчанию / default)")
@@ -370,7 +283,7 @@ func askLanguage(r *bufio.Reader) {
 			lang = "en"
 			return
 		default:
-			fmt.Println("  " + tr("введите 1 или 2 / enter 1 or 2", "введите 1 или 2 / enter 1 or 2"))
+			fmt.Println("  введите 1 или 2 / enter 1 or 2")
 		}
 	}
 }
@@ -394,7 +307,7 @@ func askOne(r *bufio.Reader, cur formatCfg, menuColor uint16) formatCfg {
 		}
 		f, err := parseFmt(line, cur)
 		if err != nil {
-			fmt.Println("  "+tr("ошибка: ", "error: ") + err.Error())
+			fmt.Println("  " + tr("ошибка: ", "error: ") + err.Error())
 			continue
 		}
 		if f.mode == 2 {
@@ -416,83 +329,263 @@ func askOne(r *bufio.Reader, cur formatCfg, menuColor uint16) formatCfg {
 	}
 }
 
+func askAddon(r *bufio.Reader) bool {
+	printC(colorYellow, tr(
+		"Свой всплывающий текст (Blizzard_CombatText):\n",
+		"Own floating text (Blizzard_CombatText):\n"))
+	fmt.Println(tr("  0 — не трогать", "  0 — leave as is"))
+	fmt.Println(tr(
+		"  1 — модифицировать аддоном (Enter = да)",
+		"  1 — modify via addon (Enter = yes)"))
+	return yesNo(r)
+}
+
+// askAddonSchool — цветной текст в аддоне. Enter = как выбрано в exe.
+func askAddonSchool(r *bufio.Reader, exeSchool bool) bool {
+	printC(colorYellow, tr(
+		"Цветной текст в аддоне (свой всплывающий текст):\n",
+		"Colored text in the addon (self floating text):\n"))
+	fmt.Println(tr("  0 — без цвета (только формат цифр)", "  0 — no color (numbers only)"))
+	fmt.Println(tr("  1 — цвет школы, как в exe", "  1 — school colors, same as in the exe"))
+	if exeSchool {
+		fmt.Println(tr("  (Enter = 1)", "  (Enter = 1)"))
+	} else {
+		fmt.Println(tr("  (Enter = 0)", "  (Enter = 0)"))
+	}
+	return yesNo(r)
+}
+
+// askSchool — цвет цифр урона заклинаниями (и в мире, и в аддоне «своего»
+// текста, если он включён). Enter = включить.
+func askSchool(r *bufio.Reader) bool {
+	printC(colorYellow, tr(
+		"Цвет цифр заклинаний:\n",
+		"Spell damage color:\n"))
+	fmt.Print(tr(
+		"  0 — как в игре: жёлтый (255,222,0)\n",
+		"  0 — as in the game: yellow (255,222,0)\n"))
+	fmt.Print(tr(
+		"  1 — по школе заклинания: каждой маске школ из таблицы клиента —\n"+
+			"      свой цвет (физика белая, святая золотистая, огонь красный,\n"+
+			"      природа зелёная, лёд голубой, тень фиолетовая, тайная бирюзовая,\n"+
+			"      все школы сразу — розово-фиолетовая)\n",
+		"  1 — by spell school: every client school mask gets its own color\n"+
+			"      (physical white, holy golden, fire red, nature green, frost\n"+
+			"      light blue, shadow purple, arcane turquoise, all schools —\n"+
+			"      chaos pink)\n"))
+	fmt.Println(tr(
+		"Автоатаки остаются белыми; смешанные школы — свой цвет каждой маске.",
+		"Auto-attacks stay white; every school blend has its own color."))
+	fmt.Println(tr("  (Enter = 1)", "  (Enter = 1)"))
+	return yesNo(r)
+}
+
+func yesNo(r *bufio.Reader) bool {
+	for {
+		fmt.Print(tr("выбор: ", "choose: "))
+		line, err := r.ReadString('\n')
+		if err != nil {
+			exit(1)
+		}
+		switch strings.TrimSpace(strings.ToLower(line)) {
+		case "", "1", "да", "yes", "y", "д", "on", "true":
+			return true
+		case "0", "нет", "no", "n", "н", "off", "false":
+			return false
+		default:
+			fmt.Println("  " + tr("введите 0 или 1", "enter 0 or 1"))
+		}
+	}
+}
+
+// resolveArgs сводит CLI и интерактив к конкретному выбору. Возвращает
+// false, если пользователь отменил всё.
+func resolveArgs(curDmg, curHeal formatCfg, curSchool bool) (dmg formatCfg, heal formatCfg, school bool, wantAddon bool, addonSchool bool, ok bool) {
+	r := bufio.NewReader(os.Stdin)
+
+	needInteractive := cliDmg == "" || cliHeal == "" || cliAddon == "" || cliSch == "" || cliAddonSch == ""
+	if needInteractive {
+		askLanguage(r)
+	}
+	if cliDmg != "" || cliHeal != "" {
+		var err error
+		dmg, err = parseFmt(cliDmg, curDmg)
+		if err != nil {
+			errln(tr("ОШИБКА: --dmg: ", "ERROR: --dmg: ") + err.Error())
+			return dmg, heal, school, wantAddon, addonSchool, false
+		}
+		heal, err = parseFmt(cliHeal, curHeal)
+		if err != nil {
+			errln(tr("ОШИБКА: --heal: ", "ERROR: --heal: ") + err.Error())
+			return dmg, heal, school, wantAddon, addonSchool, false
+		}
+	} else {
+		printC(colorRed, tr("Цифры урона:", "Damage numbers:")+"\n")
+		dmg = askOne(r, curDmg, colorRed)
+		printC(colorGreen, tr("Цифры лечения:", "Heal numbers:")+"\n")
+		heal = askOne(r, curHeal, colorGreen)
+	}
+	switch strings.ToLower(cliSch) {
+	case "1", "да", "yes", "y", "on", "true":
+		school = true
+	case "0", "нет", "no", "n", "off", "false":
+		school = false
+	default:
+		school = askSchool(r)
+	}
+	switch strings.ToLower(cliAddon) {
+	case "1", "да", "yes", "y", "on", "true":
+		wantAddon = true
+	case "0", "нет", "no", "n", "off", "false":
+		wantAddon = false
+	default:
+		wantAddon = askAddon(r)
+	}
+	// Вопрос про цвет в аддоне — сразу после вопроса об аддоне, и только
+	// если аддон ставится: «не надо аддон» = оба пропущены.
+	switch strings.ToLower(cliAddonSch) {
+	case "1", "да", "yes", "y", "д", "on", "true":
+		addonSchool = true
+	case "0", "нет", "no", "n", "н", "off", "false":
+		addonSchool = false
+	default:
+		if wantAddon {
+			addonSchool = askAddonSchool(r, school)
+		} else {
+			addonSchool = false
+		}
+	}
+	return dmg, heal, school, wantAddon, addonSchool, true
+}
+
 // ---------- применение патча ----------
 
-// doPatch вшивает форматтер и переключает вызовы.
-func doPatch(exe string, data []byte, pe *peInfo, dmg, heal formatCfg) int {
-	// 1. Определяем пещеру: пустая .zdata или новая секция в конце.
-	caveOff, caveVA, data, err := ensureCave(data, pe)
+// readCurrentConfig читает сохранённые настройки из вшитой секции.
+func readCurrentConfig(data []byte, pe *peInfo) (dmg, heal formatCfg, school bool) {
+	dmg = formatCfg{mode: 0, dec: 2}
+	heal = formatCfg{mode: 0, dec: 2}
+	off, _, ok := findOurCave(data, pe)
+	if !ok {
+		return dmg, heal, false
+	}
+	dmg = formatCfg{mode: data[off+offModeDmg], dec: data[off+offDecDmg]}
+	heal = formatCfg{mode: data[off+offModeHeal], dec: data[off+offDecHeal]}
+	for i := range pe.sections {
+		s := &pe.sections[i]
+		base := int(s.rawptr)
+		if s.rawsize < caveSize || base+offSchMagic+4 > len(data) {
+			continue
+		}
+		if string(data[base+offSchMagic:base+offSchMagic+4]) == string(schMagic[:]) {
+			school = true
+			break
+		}
+	}
+	return dmg, heal, school
+}
+
+// siteByte — что должно лежать (или уже лежать) в первом байте сайта.
+func siteByte(va uint32) byte {
+	for _, d := range dmgCallVAs {
+		if d == va {
+			return 0xE8 // call
+		}
+	}
+	if va == healCallVA {
+		return 0xE8 // call
+	}
+	return 0xB8 // mov (эквивалентность обоих цветовых mov не критична:
+	//          сравнивается целиком ниже)
+}
+
+func doPatch(exe string, pe *peInfo, dmg, heal formatCfg, school, wantAddon, addonSchool bool) (code int) {
+	caveOff, caveVA, data, err := ensureCave(exe, pe)
 	if err != nil {
 		errln(tr("ОШИБКА: ", "ERROR: ") + err.Error())
 		return 2
 	}
 
-	// 2. Образ пещеры: конфиг + две копии кода.
-	img, err := buildCaveImage(dmg.mode, clampDec(dmg.dec), heal.mode, clampDec(heal.dec), caveVA)
-	if err != nil {
-		errln(tr("ОШИБКА сборки кода: ", "ERROR building code: ") + err.Error())
+	img, imgErr := buildCaveImage(dmg.mode, clampDec(dmg.dec), heal.mode, clampDec(heal.dec), school, caveVA)
+	if imgErr != nil {
+		errln(tr("ОШИБКА сборки кода: ", "ERROR building code: ") + imgErr.Error())
 		return 2
 	}
 	copy(data[caveOff:caveOff+caveSize], img)
 
-	// 3. Перенаправляем вызовы: три сайта урона → код урона, лечение → код
-	// лечения. Перезапись E8 rel32 работает и поверх старого dots-патча.
-	dmgCallVAs := []uint32{0x0070F8B4, 0x0070F914, 0x007223CF}
-	sites := make([][2]uint32, 0, 4)
+	// Собираем список правок: форматтер + школа.
+	type edit struct{ va, target uint32 }
+	var edits []edit
 	for _, va := range dmgCallVAs {
-		sites = append(sites, [2]uint32{va, caveVA + offCodeDmg})
+		edits = append(edits, edit{va, caveVA + offCodeDmg})
 	}
-	sites = append(sites, [2]uint32{healCallVA, caveVA + offCodeHeal})
-	for _, s := range sites {
-		off, err := pe.vaToOffset(s[0])
-		if err != nil {
-			fmt.Printf(tr("ОШИБКА: сайт %08X: %v\n", "ERROR: site %08X: %v\n"), s[0], err)
+	edits = append(edits, edit{healCallVA, caveVA + offCodeHeal})
+	if school {
+		for _, sp := range colorSites {
+			edits = append(edits, edit{sp.va, caveVA + sp.stub})
+		}
+	}
+
+	for _, ed := range edits {
+		off, oerr := pe.vaToOffset(ed.va)
+		if oerr != nil {
+			errln("ОШИБКА / ERROR: " + fmtErr(tr(
+				"сайт %08X не найден в секциях", "site %08X not found in sections"), ed.va).Error())
 			return 2
 		}
-		if data[off] != 0xE8 {
-			fmt.Printf(tr(
-				"ОШИБКА: по адресу %08X нет команды call (байт %02X) —\n        это не билд 12340 или сайт уже занят чужим патчем.\n",
-				"ERROR: address %08X has no call (byte %02X) —\n        not a 12340 build or the site is already patched.\n"),
-				s[0], data[off])
+		first := data[off]
+		// oursOrOrig: первый байт — исходный (0xE8 call / 0xB8, 0xBF mov)
+		// или наш ранний переход (0xE9) — оба случая правим заново.
+		if first != 0xE8 && first != 0xE9 && first != 0xB8 && first != 0xBF {
+			errln("ОШИБКА / ERROR: " + fmtErr(tr(
+				"по адресу %08X нет call/mov (байт %02X) — это не билд 12340 или сайт занят чужим патчем; файл не изменён.",
+				"address %08X holds neither call nor mov (byte %02X) — not a 12340 build, or a foreign patch is there; file not modified."), ed.va, first).Error())
 			return 2
 		}
-		rel := int32(s[1]) - int32(s[0]+5)
 		data[off] = 0xE8
+		if ed.target != caveVA+offCodeDmg && ed.target != caveVA+offCodeHeal {
+			data[off] = 0xE9 // цветовый сайт — jmp на стаб
+		}
+		rel := int32(ed.target) - int32(ed.va+5)
 		binary.LittleEndian.PutUint32(data[off+1:], uint32(rel))
 	}
 
 	if err := writeWithBackup(exe, data); err != nil {
-		fmt.Println(tr("ОШИБКА: ", "ERROR: ") + err.Error())
+		errln(tr("ОШИБКА: ", "ERROR: ") + err.Error())
 		return 3
 	}
+
 	fmt.Printf(tr("код:         VA %08X, файл %08X%s\n", "code:        VA %08X, file %08X%s\n"),
-		caveVA, caveOff, caveNote)
+		caveVA, caveOff, secNote)
 	fmt.Printf(tr(
-		"вызовы:      урон %s → %08X, лечение %08X → %08X\n",
-		"calls:       damage %s → %08X, heal %08X → %08X\n"),
-		vaList(dmgCallVAs), caveVA+offCodeDmg, healCallVA, caveVA+offCodeHeal)
+		"форматы:     урон %s → %08X, лечение %08X → %08X\n",
+		"formats:     damage %s → %08X, heal %08X → %08X\n"),
+		dmg.describe(), caveVA+offCodeDmg, healCallVA, caveVA+offCodeHeal)
+	if school {
+		fmt.Printf(tr(
+			"цвет школы:  урон %08X, DoT %08X → %08X\n",
+			"school colors: damage %08X, DoT %08X → %08X\n"),
+			colorSites[0].va, colorSites[1].va, caveVA+offStubA)
+	}
 	fmt.Println(tr("готово. Запустите клиент и проверьте цифры боя.",
 		"Done. Run the client and check the combat numbers."))
+	if wantAddon {
+		doAddon(exe, dmg, heal, addonSchool)
+	}
 	return 0
 }
 
-var caveNote string
+var secNote string
 
-func vaList(vas []uint32) string {
-	parts := make([]string, len(vas))
-	for i, v := range vas {
-		parts[i] = fmt.Sprintf("%08X", v)
+// ensureCave находит место под вшитый код: наша секция → пустая .zdata →
+// новая секция .w3cs в конце файла.
+func ensureCave(exe string, pe *peInfo) (int, uint32, []byte, error) {
+	data, err := os.ReadFile(exe)
+	if err != nil {
+		return 0, 0, nil, fmtErr(tr(
+			"не удалось прочитать файл: ", "failed to read the file: ") + err.Error())
 	}
-	return strings.Join(parts, ",")
-}
-
-// ensureCave находит 4КБ под код: пустая .zdata или новая секция в конце
-// файла. Возвращает файловое смещение, VA и, возможно, расширенный файл.
-func ensureCave(data []byte, pe *peInfo) (int, uint32, []byte, error) {
-	// Своя пещера с меткой W3FM — переиспользуем её при повторном запуске,
-	// чтобы не плодить секции (иначе каждый прогон добавлял бы новую .w3fm).
 	if off, va, ok := findOurCave(data, pe); ok {
-		caveNote = tr(" (код уже вшит — переиспользован)", " (code already injected, reused)")
+		secNote = tr(" (вшитый код переиспользован)", " (injected code reused)")
 		return off, va, data, nil
 	}
 	// Пустая .zdata?
@@ -500,6 +593,9 @@ func ensureCave(data []byte, pe *peInfo) (int, uint32, []byte, error) {
 		s := &pe.sections[i]
 		if s.name == zdataName && s.rawsize >= caveSize {
 			off := int(s.rawptr)
+			if off+caveSize > len(data) {
+				continue
+			}
 			empty := true
 			for _, b := range data[off : off+caveSize] {
 				if b != 0 {
@@ -508,16 +604,17 @@ func ensureCave(data []byte, pe *peInfo) (int, uint32, []byte, error) {
 				}
 			}
 			if empty {
-				caveNote = tr(" (секция .zdata)", " (section .zdata)")
+				secNote = tr(" (секция .zdata)", " (section .zdata)")
 				return off, imageBase + s.vaddr, data, nil
 			}
 		}
 	}
-	// Наш прошлый патч уже добавлял секцию?
+	// Не наша секция .w3cs (например от старого dots-патча): смотрим,
+	// хватиёт ли размера — переписываем под наш образ целиком.
 	for i := range pe.sections {
 		s := &pe.sections[i]
-		if s.name == addSecName && s.vsize >= caveSize {
-			caveNote = tr(" (секция .w3fm уже была)", " (section .w3fm already present)")
+		if s.name == addSecName && s.rawsize >= caveSize {
+			secNote = tr(" (секция .w3cs переписана)", " (section .w3cs rewritten)")
 			return int(s.rawptr), imageBase + s.vaddr, data, nil
 		}
 	}
@@ -531,7 +628,6 @@ func addSection(data []byte, pe *peInfo) (int, uint32, []byte, error) {
 			"таблица секций переполнена",
 			"section table is full"))
 	}
-	// Хвост последней секции в файле.
 	end := uint32(0)
 	for i := range pe.sections {
 		if e := pe.sections[i].rawptr + pe.sections[i].rawsize; e > end {
@@ -541,9 +637,6 @@ func addSection(data []byte, pe *peInfo) (int, uint32, []byte, error) {
 	rawPtr := alignUp(end, fileAlign)
 	rawSize := alignUp(caveSize, fileAlign)
 
-	// VA — за последней секцией, с выравниванием; следим, чтобы не
-	// пересечься с .tls/.rsrc, лежащими после: берём максимум конца
-	// виртуального пространства.
 	virtEnd := uint32(0)
 	for i := range pe.sections {
 		if e := pe.sections[i].vaddr + pe.sections[i].vsize; e > virtEnd {
@@ -552,51 +645,44 @@ func addSection(data []byte, pe *peInfo) (int, uint32, []byte, error) {
 	}
 	vaddr := alignUp(virtEnd, sectAlign)
 
-	// Заголовки должны влезть: новая запись — после существующих.
 	newSecEnd := pe.secTableOff + (len(pe.sections)+1)*40
 	if newSecEnd > len(data) || uint32(newSecEnd) > pe.headersSize {
-		// Слегка параноидально: за заголовками следуют данные; расширять
-		// заголовки не будем — на практике у 12340 запас есть.
 		return 0, 0, nil, fmtErr(tr(
 			"нет места в таблице секций",
 			"no space in the section table"))
 	}
 
-	// Дописываем данные в конец файла.
 	newLen := int(rawPtr + rawSize)
 	out := make([]byte, newLen)
 	copy(out, data)
 
-	// Запись секции.
 	o := pe.secTableOff + len(pe.sections)*40
 	hdr := make([]byte, 40)
 	copy(hdr, addSecName)
-	binary.LittleEndian.PutUint32(hdr[8:], uint32(caveSize)) // VirtualSize
-	binary.LittleEndian.PutUint32(hdr[12:], vaddr)           // VirtualAddress
-	binary.LittleEndian.PutUint32(hdr[16:], rawSize)         // SizeOfRawData
-	binary.LittleEndian.PutUint32(hdr[20:], rawPtr)          // PointerToRawData
-	binary.LittleEndian.PutUint32(hdr[36:], secCharRWX)      // Characteristics
+	binary.LittleEndian.PutUint32(hdr[8:], caveSize) // VirtualSize
+	binary.LittleEndian.PutUint32(hdr[12:], vaddr)   // VirtualAddress
+	binary.LittleEndian.PutUint32(hdr[16:], rawSize) // SizeOfRawData
+	binary.LittleEndian.PutUint32(hdr[20:], rawPtr)  // PointerToRawData
+	binary.LittleEndian.PutUint32(hdr[36:], secCharRWX)
 	copy(out[o:], hdr)
 
-	// Число секций и SizeOfImage.
 	binary.LittleEndian.PutUint16(out[pe.peOff+6:], uint16(len(pe.sections)+1))
-	binary.LittleEndian.PutUint32(out[pe.optOff+56:], alignUp(vaddr+uint32(caveSize), sectAlign))
+	binary.LittleEndian.PutUint32(out[pe.optOff+56:], alignUp(vaddr+caveSize, sectAlign))
 
-	// Контрольную сумму обновляем: некоторые лаунчеры её проверяют.
 	putChecksum(out, pe)
-
-	caveNote = tr(
-		" (добавлена секция .w3fm, файл вырос)",
-		" (added section .w3fm, file size increased)")
+	secNote = tr(
+		" (добавлена секция .w3cs, файл вырос)",
+		" (added section .w3cs, file size increased)")
 	return int(rawPtr), imageBase + vaddr, out, nil
 }
 
-// doRestore возвращает оригинальные вызовы SStrPrintf и чистит пещеру.
+// doRestore возвращает оригинальные вызовы/mov на всех шести сайтах и
+// чистит вшитый код.
 func doRestore(exe string) int {
 	data, err := os.ReadFile(exe)
 	if err != nil {
 		errln("ОШИБКА / ERROR: " + tr(
-		"не удалось прочитать файл: ", "failed to read the file: ") + err.Error())
+			"не удалось прочитать файл: ", "failed to read the file: ") + err.Error())
 		return 3
 	}
 	pe, err := parsePE(data)
@@ -604,24 +690,41 @@ func doRestore(exe string) int {
 		errln(tr("ОШИБКА: ", "ERROR: ") + err.Error())
 		return 2
 	}
-	dmgCallVAs := []uint32{0x0070F8B4, 0x0070F914, 0x007223CF}
-	sites := append([]uint32{}, dmgCallVAs...)
-	sites = append(sites, healCallVA)
-	for _, va := range sites {
-		off, err := pe.vaToOffset(va)
-		if err != nil {
-			fmt.Printf(tr("ОШИБКА: сайт %08X: %v\n", "ERROR: site %08X: %v\n"), va, err)
+	// Форматтер: E8 rel32 → SStrPrintf на каждом сайте.
+	for _, va := range append(append([]uint32{}, dmgCallVAs...), healCallVA) {
+		off, oerr := pe.vaToOffset(va)
+		if oerr != nil {
+			errln("ОШИБКА / ERROR: " + fmtErr(tr(
+				"сайт %08X: ", "site %08X: "), va).Error() + " — " + oerr.Error())
 			return 2
 		}
-		if data[off] != 0xE8 {
-			fmt.Printf(tr(
-				"ОШИБКА: по адресу %08X нет call — файл не похож на билд 12340\n",
-				"ERROR: no call at address %08X — the file does not match build 12340\n"), va)
+		if data[off] != 0xE8 && data[off] != 0xE9 {
+			errln("ОШИБКА / ERROR: " + fmtErr(tr(
+				"по адресу %08X нет call — файл не похож на билд 12340",
+				"no call at address %08X — the file does not match build 12340"), va).Error())
 			return 2
 		}
-		binary.LittleEndian.PutUint32(data[off+1:], uint32(int32(sstrPrintfVA)-int32(va+5)))
+		data[off] = 0xE8
+		binary.LittleEndian.PutUint32(data[off+1:],
+			uint32(int32(sstrPrintfVA)-int32(va+5)))
 	}
-	// Чистим пещеру, если она наша.
+	// Цвет: mov eax/edi, 0xADA6C обратно.
+	for _, sp := range colorSites {
+		off, oerr := pe.vaToOffset(sp.va)
+		if oerr != nil {
+			errln("ОШИБКА / ERROR: " + fmtErr(tr(
+				"сайт %08X: ", "site %08X: "), sp.va).Error() + " — " + oerr.Error())
+			return 2
+		}
+		if data[off] != sp.orig[0] && data[off] != 0xE9 {
+			errln("ОШИБКА / ERROR: " + fmtErr(tr(
+				"по адресу %08X ни исходный mov, ни наш переход — файл не тронут нами.",
+				"address %08X holds neither the original mov nor our jump — not our patch."), sp.va).Error())
+			return 2
+		}
+		copy(data[off:off+5], sp.orig[:])
+	}
+	// Вшитый код — нулями.
 	if off, _, ok := findOurCave(data, pe); ok {
 		for i := off; i < off+caveSize; i++ {
 			data[i] = 0
@@ -635,41 +738,12 @@ func doRestore(exe string) int {
 		fmt.Println(tr("аддон dmg_format_patcher удалён.", "dmg_format_patcher addon removed."))
 	}
 	fmt.Println(tr(
-		"восстановлено: вызовы SStrPrintf, вшитый код очищен.",
-		"restored: SStrPrintf calls, injected code cleared."))
+		"восстановлено: вызовы SStrPrintf, жёлтый цвет спелл-урона, вшитый код очищен.",
+		"restored: SStrPrintf calls, yellow spell damage color, injected code cleared."))
 	return 0
 }
 
-// findOurCave ищет пещеру с нашей меткой W3FM (конфиг-область или код).
-func findOurCave(data []byte, pe *peInfo) (int, uint32, bool) {
-	for i := range pe.sections {
-		s := &pe.sections[i]
-		if s.rawsize < caveSize {
-			continue
-		}
-		off := int(s.rawptr)
-		if off+caveSize > len(data) {
-			continue
-		}
-		if string(data[off+offMagic:off+offMagic+4]) == string(caveMagic[:]) {
-			return off, imageBase + s.vaddr, true
-		}
-	}
-	return 0, 0, false
-}
-
-// readCurrentConfig читает сохранённые настройки из пещеры (для подсказки
-// «оставить как есть» при повторном запуске).
-func readCurrentConfig(data []byte, pe *peInfo) (dmg, heal formatCfg) {
-	off, _, ok := findOurCave(data, pe)
-	if !ok {
-		return formatCfg{mode: 0, dec: 2}, formatCfg{mode: 0, dec: 2}
-	}
-	dmg = formatCfg{mode: data[off+offModeDmg], dec: data[off+offDecDmg]}
-	heal = formatCfg{mode: data[off+offModeHeal], dec: data[off+offDecHeal]}
-	return dmg, heal
-}
-
+// writeWithBackup сохраняет бэкап один раз и записывает новый exe.
 func writeWithBackup(exe string, data []byte) error {
 	backup := exe + ".bak"
 	if _, err := os.Stat(backup); err != nil {
@@ -699,6 +773,34 @@ func writeWithBackup(exe string, data []byte) error {
 			"failed to save client"), err)
 	}
 	return nil
+}
+
+// ---------- аддон ----------
+
+// doAddon пишет аддон в текущую папку и напоминает перенести в корень игры.
+func doAddon(exe string, dmg, heal formatCfg, school bool) { // school = addonSchool
+	cwd, err := os.Getwd()
+	if err != nil {
+		errln(tr("ОШИБКА: не определить текущую папку: ", "ERROR: cannot get current folder: ") + err.Error())
+		return
+	}
+	path, err := writeAddon(cwd, dmg, heal, school)
+	if err != nil {
+		errln(err.Error())
+		return
+	}
+	printC(colorGreen, tr("аддон:       %s\n", "addon:       %s\n"), path)
+
+	gameDir, _ := filepath.Abs(filepath.Dir(exe))
+	cwdAbs, _ := filepath.Abs(cwd)
+	if !strings.EqualFold(cwdAbs, gameDir) {
+		printC(colorYellow, tr(
+			"ВНИМАНИЕ: патчер запущен не из корневой папки игры —\n"+
+				"перенесите папку аддона вручную:\n  %s\nв\n  %s\n",
+			"NOTE: the patcher was started outside the game root folder —\n"+
+				"move the addon folder manually:\n  %s\ninto\n  %s\n"),
+			path, filepath.Join(gameDir, "Interface", "AddOns"))
+	}
 }
 
 // ---------- PE ----------
@@ -796,7 +898,6 @@ func alignUp(v, a uint32) uint32 {
 
 // putChecksum пересчитывает контрольную сумму PE.
 func putChecksum(data []byte, pe *peInfo) {
-	// Сначала обнулить старую.
 	binary.LittleEndian.PutUint32(data[pe.optOff+64:], 0)
 	var sum uint64
 	ln := len(data)
@@ -822,13 +923,11 @@ func setupConsole() {
 	k32.NewProc("SetConsoleOutputCP").Call(65001)
 }
 
+// resolveTarget — путь к Wow.exe: аргумент, текущая папка или рядом с exe.
 func resolveTarget(args []string) string {
 	if len(args) > 0 && args[0] != "" {
 		return args[0]
 	}
-
-	// Без аргументов ищем клиент сначала в текущей папке запуска,
-	// затем рядом с самим патчером. Имя сравниваем без учёта регистра.
 	var dirs []string
 	if cwd, err := os.Getwd(); err == nil {
 		dirs = append(dirs, cwd)
@@ -836,7 +935,6 @@ func resolveTarget(args []string) string {
 	if exe, err := os.Executable(); err == nil {
 		dirs = append(dirs, filepath.Dir(exe))
 	}
-
 	seen := make(map[string]bool)
 	for _, dir := range dirs {
 		key := strings.ToLower(filepath.Clean(dir))
@@ -857,8 +955,7 @@ func resolveTarget(args []string) string {
 			}
 		}
 	}
-
-	errln("ОШИБКА / ERROR: Wow.exe не найден в текущей папке или рядом с патчером. / Wow.exe not found in the current folder or next to the patcher.\nУкажите путь к Wow.exe / Specify the path to Wow.exe, например / for example:")
+	errln("ОШИБКА / ERROR: Wow.exe не найден в текущей папке или рядом с патчером. / Wow.exe not found in the current folder or next to the patcher.\nУкажите путь к Wow.exe / Specify the path to Wow.exe:")
 	fmt.Println(`  dmg_format_patcher.exe "D:\Games\World of Warcraft\Wow.exe"`)
 	exit(1)
 	return ""
