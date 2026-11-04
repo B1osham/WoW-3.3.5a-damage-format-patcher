@@ -1,5 +1,7 @@
 package main
 
+import "math"
+
 // cave.go — машинный код, вшиваемый в секцию клиента, и мини-ассемблер
 // для его генерации.
 //
@@ -35,7 +37,7 @@ var schoolTypes = []schoolType{
 	{0x0C, argb(208, 255, 0)},   // SPELL_SCHOOL_FIRESTORM
 	{0x10, argb(64, 130, 255)},  // SPELL_SCHOOL_FROST — мягкий голубой
 	{0x11, argb(64, 130, 255)},  // SPELL_SCHOOL_FROSTSTRIKE = frost
-	{0x14, argb(255, 0, 128)},   // SPELL_SCHOOL_FROSTFIRE
+	{0x14, argb(170, 0, 230)},   // SPELL_SCHOOL_FROSTFIRE — краски: красный+синий=фиолетовый
 	{0x18, argb(0, 255, 128)},   // SPELL_SCHOOL_FROSTSTORM
 	{0x1C, argb(170, 255, 160)}, // SPELL_SCHOOL_ELEMENTAL (три школы)
 	{0x20, argb(185, 0, 171)},   // SPELL_SCHOOL_SHADOW — фиолетовый
@@ -61,13 +63,13 @@ func argb(r, g, b uint32) uint32 {
 
 // lutMaskIndexes — таблица «маска → индекс цвета», 128 байт.
 // Неизвестная маска даёт fallback.
-func lutMaskIndexes() []byte {
+func lutMaskIndexes(palette []schoolType) []byte {
 	lut := make([]byte, 0x80)
-	unknown := byte(len(schoolTypes)) // fallback
+	unknown := byte(len(palette)) // fallback
 	for i := range lut {
 		lut[i] = unknown
 	}
-	for i, st := range schoolTypes {
+	for i, st := range palette {
 		lut[st.mask] = byte(i)
 	}
 	return lut
@@ -229,7 +231,7 @@ func hereAt(a *asmBuf, stubVA uint32) uint32 {
 
 // buildCaveImage — образ секции: конфиг + две копии форматтера + блок
 // школы (цвета, указатели на них, LUT) + два стаба.
-func buildCaveImage(dmgMode, dmgDec, healMode, healDec byte, withSchool bool, caveVA uint32) ([]byte, error) {
+func buildCaveImage(dmgMode, dmgDec, healMode, healDec byte, withSchool bool, caveVA uint32, palette []schoolType) ([]byte, error) {
 	img := make([]byte, caveSize)
 	img[offModeDmg], img[offDecDmg] = dmgMode, dmgDec
 	img[offModeHeal], img[offDecHeal] = healMode, healDec
@@ -251,12 +253,12 @@ func buildCaveImage(dmgMode, dmgDec, healMode, healDec byte, withSchool bool, ca
 
 	if withSchool {
 		copy(img[offSchMagic:], schMagic[:])
-		n := len(schoolTypes) + 1 // + fallback-указатель на жёлтый глобал
+		n := len(palette) + 1 // + fallback-указатель на жёлтый глобал
 		if colorsOff+4*n > ptrTableOff || ptrTableOff+4*n > lutOff || lutOff+0x80 > offStubA {
 			return nil, asmError{"блок школы не влезает в слоты секции"}
 		}
 		// значения цветов и указатели на них
-		for i, st := range schoolTypes {
+		for i, st := range palette {
 			imm32At(img, colorsOff+4*i, st.color)
 			imm32At(img, ptrTableOff+4*i, caveVA+colorsOff+uint32(4*i))
 		}
@@ -264,8 +266,7 @@ func buildCaveImage(dmgMode, dmgDec, healMode, healDec byte, withSchool bool, ca
 		imm32At(img, colorsOff+4*n-4, 0xFFFFDE00)
 		imm32At(img, ptrTableOff+4*n-4, yellowColorVA)
 		// LUT: маска → индекс цвета (fallback = последний индекс).
-		lut := lutMaskIndexes()
-		copy(img[lutOff:], lut)
+		copy(img[lutOff:], lutMaskIndexes(palette))
 		aCode, err := genStub(0xB8, backDamageVA, caveVA+ptrTableOff, caveVA+lutOff, caveVA+offStubA)
 		if err != nil {
 			return nil, err
@@ -509,4 +510,133 @@ func imm32At(img []byte, off int, v uint32) {
 	img[off+1] = byte(v >> 8)
 	img[off+2] = byte(v >> 16)
 	img[off+3] = byte(v >> 24)
+}
+
+// knownMasks — все осмысленные маски школ (таблица SPELL_SCHOOL клиента).
+var knownMasks = []byte{
+	0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x08, 0x09, 0x0A, 0x0C, 0x10,
+	0x11, 0x14, 0x18, 0x1C, 0x20, 0x21, 0x22, 0x24, 0x28, 0x31,
+	0x40, 0x42, 0x44, 0x48, 0x50, 0x60, 0x7E, 0x7F,
+}
+
+// blendPalette собирает палитру из базовых цветов школ (ключи — маски
+// 0x01..0x40 и 0x7F для chaos): одиночная маска — свой цвет, сочетание
+// школ — смешивание «как красками» (paintMix) из цветов базовых школ,
+// физика в цвете сочетания не участвует.
+func blendPalette(base map[byte][3]uint8) []schoolType {
+	// «все магии» — фиксированная лаванда: круговое смешивание шести
+	// оттенков даёт грязный цвет
+	curated := map[byte]uint32{}
+	for _, st := range schoolTypes {
+		curated[st.mask] = st.color
+	}
+	out := make([]schoolType, 0, len(knownMasks))
+	for _, m := range knownMasks {
+		var col [3]uint8
+		switch {
+		case m == 0x7F:
+			c := base[0x7F]
+			col = [3]uint8{c[0], c[1], c[2]}
+		case m&0x7E == 0:
+			c := base[0x01]
+			col = [3]uint8{c[0], c[1], c[2]}
+		default:
+			magic := m & 0x7E
+			var cols [][3]uint8
+			for b := byte(0x02); b != 0; b <<= 1 {
+				if magic&b != 0 {
+					cols = append(cols, base[b])
+				}
+			}
+			if len(cols) == 1 {
+				col = cols[0]
+			} else if m == 0x7E {
+				cc := curated[m]
+				col = [3]uint8{uint8(cc >> 16), uint8(cc >> 8), uint8(cc)}
+			} else {
+				col = paintMix(cols)
+			}
+		}
+		out = append(out, schoolType{m, argb(uint32(col[0]), uint32(col[1]), uint32(col[2]))})
+	}
+	return out
+}
+
+// paintMix — смешение «как красками»: оттенки усредняются по кругу
+// (жёлтый+синий = зелёный, красный+синий = фиолетовый, а не серое
+// среднее). Насыщенность и яркость смеси — средние, взятые с весом
+// насыщенности: серые и очень тёмные цвета не тянут оттенок на себя.
+func paintMix(cols [][3]uint8) [3]uint8 {
+	var sx, sy, wSum, sSum, vSum float64
+	for _, c := range cols {
+		h, s, v := rgbToHsv(c[0], c[1], c[2])
+		w := s * v
+		rad := h * math.Pi / 180
+		sx += w * math.Cos(rad)
+		sy += w * math.Sin(rad)
+		wSum += w
+		sSum += s * w
+		vSum += v * w
+	}
+	if wSum == 0 {
+		return [3]uint8{128, 128, 128}
+	}
+	h := math.Atan2(sy/wSum, sx/wSum) * 180 / math.Pi
+	if h < 0 {
+		h += 360
+	}
+	r, g, b := hsvToRgb(h, sSum/wSum, vSum/wSum)
+	return [3]uint8{r, g, b}
+}
+
+// rgbToHsv — RGB (0..255) → оттенок в градусах, s/v в 0..1.
+func rgbToHsv(r, g, b uint8) (h, s, v float64) {
+	fr, fg, fb := float64(r)/255, float64(g)/255, float64(b)/255
+	max := math.Max(fr, math.Max(fg, fb))
+	min := math.Min(fr, math.Min(fg, fb))
+	v = max
+	if max == 0 {
+		return 0, 0, 0
+	}
+	s = (max - min) / max
+	if s == 0 {
+		return 0, 0, v
+	}
+	d := max - min
+	switch max {
+	case fr:
+		h = math.Mod((fg-fb)/d, 6)
+	case fg:
+		h = (fb-fr)/d + 2
+	default:
+		h = (fr-fg)/d + 4
+	}
+	h *= 60
+	if h < 0 {
+		h += 360
+	}
+	return h, s, v
+}
+
+// hsvToRgb — обратное преобразование rgbToHsv.
+func hsvToRgb(h, s, v float64) (r, g, b uint8) {
+	c := v * s
+	x := c * (1 - math.Abs(math.Mod(h/60, 2)-1))
+	m := v - c
+	var fr, fg, fb float64
+	switch {
+	case h < 60:
+		fr, fg, fb = c, x, 0
+	case h < 120:
+		fr, fg, fb = x, c, 0
+	case h < 180:
+		fr, fg, fb = 0, c, x
+	case h < 240:
+		fr, fg, fb = 0, x, c
+	case h < 300:
+		fr, fg, fb = x, 0, c
+	default:
+		fr, fg, fb = c, 0, x
+	}
+	return uint8((fr + m) * 255), uint8((fg + m) * 255), uint8((fb + m) * 255)
 }

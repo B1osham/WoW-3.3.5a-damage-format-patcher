@@ -58,41 +58,11 @@ local function FormatNumber(n, mode, dec)
 	return tostring(n)
 end
 
--- ЦветаSchools: по маске школы ( SPELLSCHOOL_...) — triple {r,g,b}.
--- Приоритет МАГИИ над физикой: у маски с прочими битами физика
--- отбрасывается (как в exe-стабе); чисто физика — белый.
--- MaskColor: маска школы → {r,g,b}, значения ровно из exe-таблицы
--- (LUT в секции .w3cs). Неизвестная маска — цвет Близзардов остаётся.
+
+-- MaskColor: маска школы → {r, g, b}; при неизвестной маске остаётся
+-- цвет Близзардов.
 local MaskColor = {
-	[1]   = {255, 255, 255}, -- физика
-	[2]   = {255, 230, 120}, -- holy — золотистый «свет», [3] holystrike
-	[3]   = {255, 230, 120},
-	[4]   = {255, 0, 0},     -- fire, [5] flamestrike
-	[5]   = {255, 0, 0},
-	[6]   = {255, 140, 60},  -- holyfire — оранжевый (огонь+свет)
-	[8]   = {0, 190, 0},     -- nature (тёмно-зелёный), [9] stormstrike
-	[9]   = {0, 190, 0},
-	[10]  = {190, 255, 120}, -- holystorm — свет+природа
-	[12]  = {208, 255, 0},   -- firestorm
-	[16]  = {64, 130, 255},  -- frost (мягкий голубой), [17] froststrike
-	[17]  = {64, 130, 255},
-	[20]  = {255, 0, 128},   -- frostfire
-	[24]  = {0, 255, 128},   -- froststorm
-	[28]  = {170, 255, 160}, -- elemental
-	[32]  = {185, 0, 171},   -- shadow, [33] shadowstrike
-	[33]  = {185, 0, 171},
-	[34]  = {210, 140, 200}, -- twilight — тень+свет
-	[36]  = {255, 0, 160},   -- shadowflame
-	[40]  = {120, 180, 85},  -- plague
-	[49]  = {92, 0, 213},    -- shadowfrost
-	[64]  = {0, 255, 255},   -- arcane — бирюзовый
-	[66]  = {255, 240, 170}, -- divine — светлее holy
-	[68]  = {255, 80, 190},  -- spellfire
-	[72]  = {0, 255, 200},   -- spellstorm
-	[80]  = {0, 160, 255},   -- spellfrost
-	[96]  = {92, 128, 213},  -- spellshadow
-	[126] = {200, 160, 255}, -- magic (все магии) — лавандовый
-	[127] = {255, 0, 255},   -- chaos (все школы)
+{MASK_COLOR}
 }
 
 
@@ -100,20 +70,13 @@ local function SchoolColorRGB(mask)
 	if not USE_SCHOOL or not mask or mask == 0 then
 		return nil
 	end
-	local bit = bit or _G.bit
-	mask = bit.band(mask, 0x7F)
-	-- combat log иногда даёт школу индексом (1..7: физика..тайная):
-	-- переводим в битовую маску, чтобы MaskColor нашёлся всегда.
-	if mask <= 7 then
-		mask = bit.lshift(1, mask - 1)
-	end
-	return MaskColor[mask]
+	return MaskColor[bit.band(mask, 0x7F)]
 end
 
 -- Кэш последних уронов по ИГРОКУ из combat log: сумма-школа-время.
 -- COMBAT_TEXT_UPDATE школу не несёт, поэтому суммой ищем совпадение.
 local hist, hn = {}, 0
-local LOG_LIFETIME = 0.7
+local LOG_LIFETIME = 1.2
 
 local logFrame = CreateFrame("Frame")
 logFrame:RegisterEvent("COMBAT_LOG_EVENT_UNFILTERED")
@@ -125,11 +88,11 @@ logFrame:SetScript("OnEvent", function(_, _, timestamp, event, srcGUID, srcName,
 		-- 3.3.5: ... spellId, spellName, spellSchool, amount
 		local school, amount = select(3, ...), select(4, ...)
 		hn = hn + 1
-		hist[(hn % 8) + 1] = { amount, school, GetTime() }
+		hist[(hn % 12) + 1] = { amount, school, GetTime() }
 	elseif event == "SWING_DAMAGE" then
 		local amount = select(1, ...)
 		hn = hn + 1
-		hist[(hn % 8) + 1] = { amount, 1, GetTime() }
+		hist[(hn % 12) + 1] = { amount, 1, GetTime() }
 	end
 end)
 
@@ -139,11 +102,20 @@ local function MatchSchool(amount)
 		return nil
 	end
 	local now = GetTime()
-	for i = 1, 8 do
+	local recent
+	for i = 1, 12 do
 		local e = hist[i]
-		if e and e[1] == amount and (now - e[3]) < LOG_LIFETIME then
-			return SchoolColorRGB(e[2])
+		if e and (now - e[3]) < LOG_LIFETIME then
+			if e[1] == amount then
+				return SchoolColorRGB(e[2])
+			end
+			if not recent then
+				recent = e -- запасной вариант: самый свежий урон
+			end
 		end
+	end
+	if recent then
+		return SchoolColorRGB(recent[2])
 	end
 	return nil
 end
@@ -162,6 +134,8 @@ function CombatText_AddMessage(message, scrollFunction, r, g, b, displayType, is
 			end
 		else
 			message = "+" .. FormatNumber(n, HEAL_MODE, HEAL_DEC) .. rest
+			-- лечение светлее, чтобы отличать от тёмно-зелёной природы
+			r, g, b = 0.66, 1, 0.66
 		end
 	end
 	return origAddMessage(message, scrollFunction, r, g, b, displayType, isStaggered)
@@ -169,7 +143,7 @@ end
 `
 
 // addonLua заполняет шаблон выбранными форматами.
-func addonLua(dmg, heal formatCfg, school bool) string {
+func addonLua(dmg, heal formatCfg, school bool, palette []schoolType) string {
 	yes := "true"
 	if !school {
 		yes = "false"
@@ -180,11 +154,12 @@ func addonLua(dmg, heal formatCfg, school bool) string {
 		"{HEAL_MODE}", fmt.Sprint(int(heal.mode)),
 		"{HEAL_DEC}", fmt.Sprint(int(clampDec(heal.dec))),
 		"{USE_SCHOOL}", yes,
+		"{MASK_COLOR}", maskColorLua(palette),
 	).Replace(addonLuaTmpl)
 }
 
 // writeAddon создаёт аддон в dir\Interface\AddOns\dmg_format_patcher.
-func writeAddon(dir string, dmg, heal formatCfg, school bool) (string, error) {
+func writeAddon(dir string, dmg, heal formatCfg, school bool, palette []schoolType) (string, error) {
 	base := filepath.Join(dir, "Interface", "AddOns", addonFolder)
 	if err := os.MkdirAll(base, 0o755); err != nil {
 		return "", fmtErr(tr(
@@ -198,7 +173,7 @@ func writeAddon(dir string, dmg, heal formatCfg, school bool) (string, error) {
 			"не удалось записать %s: %v",
 			"failed to write %s: %v"), toc, err)
 	}
-	if err := os.WriteFile(lua, []byte(addonLua(dmg, heal, school)), 0o644); err != nil {
+	if err := os.WriteFile(lua, []byte(addonLua(dmg, heal, school, palette)), 0o644); err != nil {
 		return base, fmtErr(tr(
 			"не удалось записать %s: %v",
 			"failed to write %s: %v"), lua, err)
@@ -223,4 +198,16 @@ func removeAddon(dir string) bool {
 		_ = os.Remove(base)
 	}
 	return true
+}
+
+// maskColorLua — Lua-таблица «маска = {r,g,b}» из палитры.
+func maskColorLua(palette []schoolType) string {
+	var sb strings.Builder
+	for _, st := range palette {
+		r := int(st.color>>16) & 255
+		g := int(st.color>>8) & 255
+		b := int(st.color) & 255
+		fmt.Fprintf(&sb, "\t[%d] = {%d/255, %d/255, %d/255},\n", st.mask, r, g, b) // 0..1
+	}
+	return sb.String()
 }
