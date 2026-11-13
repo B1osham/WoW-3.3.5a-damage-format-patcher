@@ -134,8 +134,7 @@ function CombatText_AddMessage(message, scrollFunction, r, g, b, displayType, is
 			end
 		else
 			message = "+" .. FormatNumber(n, HEAL_MODE, HEAL_DEC) .. rest
-			-- лечение светлее, чтобы отличать от тёмно-зелёной природы
-			r, g, b = 0.66, 1, 0.66
+			-- лечение и восстановление маны — стандартный цвет Близзардов
 		end
 	end
 	return origAddMessage(message, scrollFunction, r, g, b, displayType, isStaggered)

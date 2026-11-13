@@ -781,7 +781,16 @@ func doRestore(exe string) int {
 		errln(tr("ОШИБКА: не удалось записать файл: ", "ERROR: failed to save the file: ") + err.Error())
 		return 3
 	}
+	// Аддон лежит в корне игры (рядом с exe); в текущей папке его может
+	// не быть — чистим оба места.
+	removed := false
+	if dir, err := filepath.Abs(filepath.Dir(exe)); err == nil && removeAddon(dir) {
+		removed = true
+	}
 	if cwd, err := os.Getwd(); err == nil && removeAddon(cwd) {
+		removed = true
+	}
+	if removed {
 		fmt.Println(tr("аддон dmg_format_patcher удалён.", "dmg_format_patcher addon removed."))
 	}
 	fmt.Println(tr(
@@ -836,8 +845,19 @@ func writeWithBackup(exe string, data []byte) error {
 
 // ---------- аддон ----------
 
-// doAddon пишет аддон в текущую папку и напоминает перенести в корень игры.
+// doAddon пишет аддон в корень игры (рядом с Wow.exe): именно оттуда
+// клиент загружает Interface\AddOns. Раньше аддон писался в текущую
+// папку, и при запуске патчера не из корня игры в клиенте оставалась
+// старая версия аддона с другими цветами. Если записать рядом с exe
+// нельзя (нет прав), пишем в текущую папку и предупреждаем.
 func doAddon(exe string, dmg, heal formatCfg, school bool, palette []schoolType) {
+	gameDir, err := filepath.Abs(filepath.Dir(exe))
+	if err == nil {
+		if path, werr := writeAddon(gameDir, dmg, heal, school, palette); werr == nil {
+			printC(colorGreen, tr("аддон:       %s\n", "addon:       %s\n"), path)
+			return
+		}
+	}
 	cwd, err := os.Getwd()
 	if err != nil {
 		errln(tr("ОШИБКА: не определить текущую папку: ", "ERROR: cannot get current folder: ") + err.Error())
@@ -849,17 +869,12 @@ func doAddon(exe string, dmg, heal formatCfg, school bool, palette []schoolType)
 		return
 	}
 	printC(colorGreen, tr("аддон:       %s\n", "addon:       %s\n"), path)
-
-	gameDir, _ := filepath.Abs(filepath.Dir(exe))
-	cwdAbs, _ := filepath.Abs(cwd)
-	if !strings.EqualFold(cwdAbs, gameDir) {
-		printC(colorYellow, tr(
-			"ВНИМАНИЕ: патчер запущен не из корневой папки игры —\n"+
-				"перенесите папку аддона вручную:\n  %s\nв\n  %s\n",
-			"NOTE: the patcher was started outside the game root folder —\n"+
-				"move the addon folder manually:\n  %s\ninto\n  %s\n"),
-			path, filepath.Join(gameDir, "Interface", "AddOns"))
-	}
+	printC(colorYellow, tr(
+		"ВНИМАНИЕ: не удалось записать аддон в корень игры —\n"+
+			"перенесите папку аддона вручную:\n  %s\nв\n  %s\n",
+		"NOTE: could not write the addon into the game root —\n"+
+			"move the addon folder manually:\n  %s\ninto\n  %s\n"),
+		path, filepath.Join(gameDir, "Interface", "AddOns"))
 }
 
 // ---------- PE ----------
