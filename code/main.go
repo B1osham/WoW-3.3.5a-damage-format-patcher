@@ -73,6 +73,84 @@ var colorSites = []colorSite{
 	{0x0071FA36, [5]byte{0xBF, 0x6C, 0xAA, 0xAD, 0x00}, offStubB, false}, // AddWorldText
 }
 
+// textSite — байтовая правка «больше всплывающих чисел».
+// PLAYERNAMEDESC::m_worldText[4] расширяется до [8]:
+//   - массив лежит по +0x20, слоты 4..7 занимают 0x30..0x3C;
+//   - m_zOffset переезжает 0x30 → 0x40 (в Render три обращения);
+//   - размер элемента CDataAllocator 0x38 → 0x44 (структура выросла);
+//   - New<PLAYERNAMEDESC>(0) → (1): GetData(zero=1) зануляет всю запись,
+//     иначе слоты 4..7 содержали бы мусор и первый же цикл удаления
+//     позвал бы WorldTextDelete по случайному указателю;
+//   - циклы удаления/обновления (счётчик 4 → 8, старт 0x30 → 0x40) и
+//     поиск слота в CreateWorldText (граница 4 → 8).
+// Все правки — в существующих инструкциях, пещера не нужна.
+type textSite struct {
+	va        uint32
+	orig, pat []byte
+}
+
+var textSites = []textSite{
+	// CreateWorldText: slot < 8, slot == 8
+	{0x007E5C4F, []byte{0x83, 0xFE, 0x04}, []byte{0x83, 0xFE, 0x08}},
+	{0x007E5C54, []byte{0x83, 0xFE, 0x04}, []byte{0x83, 0xFE, 0x08}},
+	// PlayerNameUpdateLate
+	{0x007E55B5, []byte{0xBF, 0x04, 0, 0, 0}, []byte{0xBF, 0x08, 0, 0, 0}},
+	{0x007E55BA, []byte{0x8D, 0x70, 0x30}, []byte{0x8D, 0x70, 0x40}},
+	// ~PLAYERNAMEDESC
+	{0x007E54E7, []byte{0xBB, 0x04, 0, 0, 0}, []byte{0xBB, 0x08, 0, 0, 0}},
+	{0x007E54EC, []byte{0x8D, 0x7E, 0x30}, []byte{0x8D, 0x7E, 0x40}},
+	// DeleteWorldText
+	{0x007E50A9, []byte{0xBF, 0x04, 0, 0, 0}, []byte{0xBF, 0x08, 0, 0, 0}},
+	{0x007E50AE, []byte{0x8D, 0x71, 0x30}, []byte{0x8D, 0x71, 0x40}},
+	// UpdateWorldText
+	{0x007E51B7, []byte{0xBB, 0x04, 0, 0, 0}, []byte{0xBB, 0x08, 0, 0, 0}},
+	{0x007E51BC, []byte{0x8D, 0x77, 0x30}, []byte{0x8D, 0x77, 0x40}},
+	// UpdateWorldTextIcons
+	{0x007E526F, []byte{0xBF, 0x04, 0, 0, 0}, []byte{0xBF, 0x08, 0, 0, 0}},
+	{0x007E5274, []byte{0x83, 0xC6, 0x30}, []byte{0x83, 0xC6, 0x40}},
+	// Render: m_zOffset 0x30 → 0x40
+	{0x007E570E, []byte{0xD9, 0x5E, 0x30}, []byte{0xD9, 0x5E, 0x40}},
+	{0x007E576D, []byte{0xD9, 0x5E, 0x30}, []byte{0xD9, 0x5E, 0x40}},
+	{0x007E57FC, []byte{0xD9, 0x46, 0x30}, []byte{0xD9, 0x46, 0x40}},
+	// New<PLAYERNAMEDESC>(zero=1): зануление всей записи
+	{0x007E5F96, []byte{0x6A, 0x00}, []byte{0x6A, 0x01}},
+	{0x007E6002, []byte{0x6A, 0x00}, []byte{0x6A, 0x01}},
+	// static CDataAllocator s_freePlayerNames(0x38, 256) → (0x44, 256)
+	{0x009D04D5, []byte{0x6A, 0x38}, []byte{0x6A, 0x44}},
+}
+
+// applyTextPatch включает (enable) или снимает расширение массива
+// всплывающих чисел. changed=true — байты файла изменились.
+func applyTextPatch(data []byte, pe *peInfo, enable bool) (changed bool, err error) {
+	for _, s := range textSites {
+		off, oerr := pe.vaToOffset(s.va)
+		if oerr != nil {
+			return changed, fmtErr(tr("сайт %08X: %v", "site %08X: %v"), s.va, oerr)
+		}
+		cur := data[off : off+len(s.orig)]
+		switch {
+		case bytesEqual(cur, s.orig):
+			if !enable {
+				continue
+			}
+			copy(cur, s.pat)
+			changed = true
+		case bytesEqual(cur, s.pat):
+			if enable {
+				continue
+			}
+			copy(cur, s.orig)
+			changed = true
+		default:
+			return changed, fmtErr(tr(
+				"по адресу %08X неожиданные байты % X — это не билд 12340 или сайт занят чужим патчем",
+				"address %08X holds unexpected bytes % X — not a 12340 build or a foreign patch"),
+				s.va, cur)
+		}
+	}
+	return changed, nil
+}
+
 // ---------- язык сообщений ----------
 
 var lang = "ru"
@@ -121,21 +199,51 @@ func main() {
 	}
 
 	curDmg, curHeal, curSchool := readCurrentConfig(data, pe)
+	// --texts-only=N — только расширение всплывающих чисел, без форматов,
+	// цветов, аддона и пересборки пещеры.
+	if cliTextsOnly != "" {
+		enable := cliTextsOnly != "0"
+		ch, terr := applyTextPatch(data, pe, enable)
+		if terr != nil {
+			errln(tr("ОШИБКА: ", "ERROR: ") + terr.Error())
+			exit(2)
+		}
+		if !ch {
+			fmt.Println(tr("уже в нужном состоянии — файл не изменён.",
+				"already in the requested state — file unchanged."))
+			exit(0)
+		}
+		putChecksum(data, pe)
+		if err := writeWithBackup(exe, data); err != nil {
+			errln(tr("ОШИБКА: ", "ERROR: ") + err.Error())
+			exit(3)
+		}
+		if enable {
+			fmt.Println(tr("всплывающие числа: до 8 одновременно (было 4).",
+				"floating numbers: up to 8 at once (was 4)."))
+		} else {
+			fmt.Println(tr("всплывающие числа: снова как в игре (до 4).",
+				"floating numbers: vanilla again (up to 4)."))
+		}
+		exit(0)
+	}
 	dmg, heal, school, wantAddon, addonSchool, ok := resolveArgs(curDmg, curHeal, curSchool)
 	if !ok {
 		return
 	}
-	exit(doPatch(exe, pe, dmg, heal, school, wantAddon, addonSchool, schoolTypes))
+	exit(doPatch(exe, pe, dmg, heal, school, wantAddon, addonSchool, cliTexts != "0", schoolTypes))
 }
 
 // ---------- разбор аргументов ----------
 
 var (
-	cliDmg      string
-	cliHeal     string
-	cliAddon    string // "" — не задан, "1"/"0" — из флага
-	cliSch      string // "" — не задан, "0"/"1" — цвет школы в exe
-	cliAddonSch string // "" — не задан, "0"/"1" — цвет школы в аддоне
+	cliDmg       string
+	cliHeal      string
+	cliAddon     string // "" — не задан, "1"/"0" — из флага
+	cliSch       string // "" — не задан, "0"/"1" — цвет школы в exe
+	cliAddonSch  string // "" — не задан, "0"/"1" — цвет школы в аддоне
+	cliTexts     string // "" — не задан, "0"/"1" — больше всплывающих чисел
+	cliTextsOnly string // "" — не задан, "0"/"1" — только эта правка
 )
 
 func parseArgs(argv []string) (targets []string, restore bool) {
@@ -153,6 +261,10 @@ func parseArgs(argv []string) (targets []string, restore bool) {
 			cliSch = strings.TrimPrefix(a, "--school=")
 		case strings.HasPrefix(a, "--addon-school="):
 			cliAddonSch = strings.TrimPrefix(a, "--addon-school=")
+		case strings.HasPrefix(a, "--texts-only="):
+			cliTextsOnly = strings.TrimPrefix(a, "--texts-only=")
+		case strings.HasPrefix(a, "--texts="):
+			cliTexts = strings.TrimPrefix(a, "--texts=")
 		case strings.HasPrefix(a, "--lang="):
 			switch strings.ToLower(strings.TrimPrefix(a, "--lang=")) {
 			case "ru", "rus", "рус":
@@ -191,6 +303,12 @@ func printUsage() {
 	fmt.Println("  ... --restore" + tr(
 		"                           вернуть оригинал",
 		"                           restore original"))
+	fmt.Println("  ... --texts=0|1" + tr(
+		"                     больше всплывающих чисел (8 вместо 4), по умолчанию 1",
+		"                     more floating numbers (8 instead of 4), default 1"))
+	fmt.Println("  ... --texts-only=0|1" + tr(
+		"                только эта правка, остальное не трогать",
+		"                only this edit, leave everything else alone"))
 	fmt.Println()
 	fmt.Println(tr(
 		"  формат: plain | dots | short[:DEC], DEC=1..3 (по умолчанию 2)",
@@ -507,7 +625,7 @@ func siteExpected(va uint32) byte {
 	return 0xB8 // mov
 }
 
-func doPatch(exe string, pe *peInfo, dmg, heal formatCfg, school, wantAddon, addonSchool bool, palette []schoolType) (code int) {
+func doPatch(exe string, pe *peInfo, dmg, heal formatCfg, school, wantAddon, addonSchool, moreTexts bool, palette []schoolType) (code int) {
 	caveOff, caveVA, data, err := ensureCave(exe, pe)
 	if err != nil {
 		errln(tr("ОШИБКА: ", "ERROR: ") + err.Error())
@@ -574,6 +692,10 @@ func doPatch(exe string, pe *peInfo, dmg, heal formatCfg, school, wantAddon, add
 		binary.LittleEndian.PutUint32(data[off+1:], uint32(rel))
 	}
 
+	if _, terr := applyTextPatch(data, pe, moreTexts); terr != nil {
+		errln(tr("ОШИБКА: ", "ERROR: ") + terr.Error())
+		return 2
+	}
 	putChecksum(data, pe)
 	if err := writeWithBackup(exe, data); err != nil {
 		errln(tr("ОШИБКА: ", "ERROR: ") + err.Error())
@@ -760,6 +882,13 @@ func doRestore(exe string) int {
 			changed = true
 		}
 		copy(data[off:off+5], sp.orig[:])
+	}
+	// Расширение всплывающих чисел — вернуть исходные константы.
+	if tch, terr := applyTextPatch(data, pe, false); terr != nil {
+		errln(tr("ОШИБКА: ", "ERROR: ") + terr.Error())
+		return 2
+	} else if tch {
+		changed = true
 	}
 	// Вшитый код — нулями.
 	clean := true

@@ -217,6 +217,7 @@ type guiState struct {
 	chkSchool   uintptr
 	chkAddon    uintptr
 	chkAddonSch uintptr
+	chkTexts    uintptr
 	btnReset    uintptr
 	btnBrowse   uintptr
 	btnScale    uintptr
@@ -228,6 +229,7 @@ type guiState struct {
 	chkSchoolOn bool // галочки — состояние переживает пересоздание окна
 	chkAddonOn  bool
 	chkAddSchOn bool
+	chkTextsOn  bool // «до 8 всплывающих чисел вместо 4»
 	scaleIdx    int  // -1 = авто (по монитору), 0..3 — тест HD/FHD/2K/4K
 	rescale     bool // окно закрыто ради пересоздания с новым масштабом
 
@@ -267,6 +269,7 @@ var gui = guiState{
 	chkSchoolOn: true,
 	chkAddonOn:  true,
 	chkAddSchOn: true,
+	chkTextsOn:  true,
 	scaleIdx:    -1, // авто
 	savedSel:    [4]int{-1, -1, -1, -1},
 }
@@ -287,6 +290,7 @@ const (
 	idBtnReset   = 1012
 	idTestScale  = 1013
 	idToggleMix  = 1014
+	idChkTexts   = 1015
 	idMixedBase  = 5000 // + строка*3 + канал
 	idSliderBase = 2000 // + школа*3 + канал
 	idRGBBase    = 3000 // + школа*3 + канал
@@ -580,16 +584,21 @@ func (g *guiState) onPatch() {
 	school := getCheck(g.chkSchool)
 	wantAddon := getCheck(g.chkAddon)
 	addonSchool := wantAddon && getCheck(g.chkAddonSch)
+	moreTexts := getCheck(g.chkTexts)
 	// успех — короткая сводка; ошибка — весь вывод из консоли
 	code := 1
 	var out string
 	out = runCaptured(func() {
-		code = doPatch(exe, pe, dmg, heal, school, wantAddon, addonSchool, paletteFromGUI())
+		code = doPatch(exe, pe, dmg, heal, school, wantAddon, addonSchool, moreTexts, paletteFromGUI())
 	})
 	if code == 0 {
 		appendLog(tr("Патч выполнен: цифры боя обновлены.", "Patch done: combat digits updated."))
 		if school {
 			appendLog(tr("Цвета урона по школам применены.", "School damage colors applied."))
+		}
+		if moreTexts {
+			appendLog(tr("Всплывающие числа: до 8 одновременно (было 4).",
+				"Floating numbers: up to 8 at once (was 4)."))
 		}
 		if wantAddon {
 			appendLog(tr("Аддон записан в Interface\\AddOns\\dmg_format_patcher.",
@@ -1238,6 +1247,14 @@ func createUI() {
 	}
 	updateDecEnabled()
 
+	// «Больше всплывающих чисел»: расширяет массив текстов в exe
+	// (PLAYERNAMEDESC::m_worldText[4] → [8]), отдельно от формата цифр.
+	gui.chkTexts = createCtl(w, "BUTTON", tr("До 8 всплывающих чисел (вместо 4)",
+		"Up to 8 floating numbers (instead of 4)"),
+		wsChildGui|wsVisibleGui|bsAutoCheckbox|wsTabstopGui, 22, 154, 296, 18, idChkTexts)
+	setCheck(gui.chkTexts, gui.chkTextsOn)
+	gui.lockables = append(gui.lockables, gui.chkTexts)
+
 	// --- аддон ---
 	gbAddon := createCtl(w, "BUTTON", tr("Цифры на персонаже (получаемый урон/лечение)",
 		"Digits on the character (incoming damage/healing)"), wsChildGui|wsVisibleGui|bsGroupbox, 334, 72, 312, 110, 0)
@@ -1519,6 +1536,7 @@ func (g *guiState) onTestScale() {
 	g.chkSchoolOn = getCheck(g.chkSchool)
 	g.chkAddonOn = getCheck(g.chkAddon)
 	g.chkAddSchOn = getCheck(g.chkAddonSch)
+	g.chkTextsOn = getCheck(g.chkTexts)
 	g.savedExe = getText(g.exeEdit)
 	g.savedSel[0] = comboSel(g.dmgCombo)
 	g.savedSel[1] = comboSel(g.dmgDec)
@@ -1607,6 +1625,7 @@ func (g *guiState) setLang(l string) {
 	g.chkSchoolOn = getCheck(g.chkSchool)
 	g.chkAddonOn = getCheck(g.chkAddon)
 	g.chkAddSchOn = getCheck(g.chkAddonSch)
+	g.chkTextsOn = getCheck(g.chkTexts)
 	g.savedExe = getText(g.exeEdit)
 	g.savedSel[0] = comboSel(g.dmgCombo)
 	g.savedSel[1] = comboSel(g.dmgDec)
